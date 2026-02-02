@@ -4,6 +4,53 @@ from typing import Tuple
 
 from sandbox_env import SandboxEnv
 
+def apply_proportional_rule(env: SandboxEnv, obs: dict, target_cpa: float) -> None:
+    """
+    Loop A: Proportional Rule (Automation).
+
+    - If CPA > target_cpa: reduce max_bid by 5%.
+    - If CPA < 0.8 * target_cpa: increase max_bid by 2%.
+    - If leads == 0: keep max_bid unchanged (blind spot).
+    """
+    latest = obs.get("latest_outcome") or {}
+    leads = int(latest.get("leads", 0))
+
+    # Edge case: no leads → cannot compute CPA; status quo
+    if leads <= 0:
+        return
+
+    cpa = float(latest.get("cpa", 0.0))
+    max_bid = float(obs.get("max_bid", 0.0))
+
+    if cpa > target_cpa:
+        new_max_bid = max_bid * 0.95  # -5%
+        env.configure(max_bid=new_max_bid)
+    elif cpa < target_cpa * 0.8:
+        new_max_bid = max_bid * 1.02  # +2%
+        env.configure(max_bid=new_max_bid)
+    # Else: within acceptable band → no change
+
+
+def apply_human_intervener(env: SandboxEnv, window_steps: int) -> None:
+    """
+    Loop B: Human Intervener (Manual).
+
+    - Reviews the last `window_steps` outcomes (typically 24h window).
+    - If total spend > 0 and total leads == 0: assumes critical failure and
+      sets max_bid to 0.01 (emergency pause).
+    """
+    history = env.state.state.history
+    if not history:
+        return
+
+    window = history[-window_steps:]
+
+    total_spend = sum(float(r.get("spend", 0.0)) for r in window)
+    total_leads = sum(int(r.get("leads", 0)) for r in window)
+
+    if total_spend > 0.0 and total_leads == 0:
+        env.configure(max_bid=0.01)
+
 
 def run_industry_baseline_simulation(
     total_steps: int = 2880,
@@ -43,44 +90,14 @@ def run_industry_baseline_simulation(
 
         # Observe current state (includes latest_outcome and config)
         obs = env.observe()
-        latest = obs.get("latest_outcome") or {}
 
-        # ------------------------------------------------------------------
-        # Loop A: Proportional Rule (Automation) – every 1 virtual hour
-        # ------------------------------------------------------------------
+        # Loop A: Proportional Rule (Automation)
         if (step + 1) % hourly_step_interval == 0:
-            leads = int(latest.get("leads", 0))
+            apply_proportional_rule(env, obs, target_cpa)
 
-            # Edge case: no leads → cannot compute CPA; status quo
-            if leads > 0:
-                cpa = float(latest.get("cpa", 0.0))
-                max_bid = float(obs.get("max_bid", 0.0))
-
-                if cpa > target_cpa:
-                    # CPA above target → reduce max_bid by 5%
-                    new_max_bid = max_bid * 0.95
-                    env.configure(max_bid=new_max_bid)
-                elif cpa < target_cpa * 0.8:
-                    # CPA comfortably below 80% of target → increase max_bid by 2%
-                    new_max_bid = max_bid * 1.02
-                    env.configure(max_bid=new_max_bid)
-                # Else: within band → no change
-
-        # ------------------------------------------------------------------
-        # Loop B: Human Intervener (Manual) – every 12 virtual hours
-        # ------------------------------------------------------------------
+        # Loop B: Human Intervener (Manual)
         if (step + 1) % human_step_interval == 0:
-            # Look back over the last 24 hours (96 steps) of history.
-            history = env.state.state.history
-            window = history[-human_step_interval:] if len(history) >= 1 else []
-
-            spend_24h = sum(float(r.get("spend", 0.0)) for r in window)
-            leads_24h = sum(int(r.get("leads", 0)) for r in window)
-
-            # If money is being spent but no leads are coming in, assume a crash.
-            if spend_24h > 0.0 and leads_24h == 0:
-                # Emergency pause
-                env.configure(max_bid=0.01)
+            apply_human_intervener(env, human_step_interval)
 
     final_state = env.observe()
     aggregate_metrics = {
@@ -106,4 +123,3 @@ if __name__ == "__main__":
     print(f"Total leads: {metrics['total_leads']}")
     print(f"Total clicks: {metrics['total_clicks']}")
     print(f"Overall CPA: {metrics['overall_cpa']}")
-

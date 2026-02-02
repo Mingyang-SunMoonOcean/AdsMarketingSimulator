@@ -45,6 +45,11 @@ class StateManager:
         self.minutes_per_day = int(minutes_per_day)
         self.results_csv_path = results_csv_path
 
+        # Optionally reset the results CSV at the start of a new run.
+        # This ensures that each simulation instance writes a fresh timeline.
+        if os.path.exists(self.results_csv_path):
+            os.remove(self.results_csv_path)
+
         self.state = SimulationState(daily_budget=float(daily_budget))
 
     # ------------------------------------------------------------------
