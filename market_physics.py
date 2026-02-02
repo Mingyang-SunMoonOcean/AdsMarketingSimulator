@@ -16,7 +16,7 @@ class MarketPhysics:
         cpc_max: float = 8.00,
         cvr_base: float = 0.025,
         k: float = 1.2,
-        base_clicks: int = 1000,
+        base_clicks: int = 5,
     ):
         # Market constants
         self.CPC_base = float(cpc_base)

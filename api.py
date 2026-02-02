@@ -7,9 +7,8 @@ from sandbox_env import SandboxEnv
 
 
 class ConfigInput(BaseModel):
-    daily_budget: float | None = None
-    max_bid: float | None = None
-
+    daily_budget: Optional[float] = None
+    max_bid: Optional[float] = None
 
 def create_app(env: Optional[SandboxEnv] = None) -> FastAPI:
     """
