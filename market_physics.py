@@ -12,11 +12,12 @@ class MarketPhysics:
 
     def __init__(
         self,
-        cpc_base: float = 1.25,
-        cpc_max: float = 8.00,
+        cpc_base: float = 2.00,
+        cpc_max: float = 20.00,
         cvr_base: float = 0.025,
         k: float = 1.2,
-        base_clicks: int = 5,
+        # simulate 0.5 clicks per step (every 15 minutes)
+        base_clicks: int = 0.5,
     ):
         # Market constants
         self.CPC_base = float(cpc_base)

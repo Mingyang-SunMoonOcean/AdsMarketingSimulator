@@ -8,9 +8,9 @@ from sandbox_env import SandboxEnv
 def run_industry_baseline_simulation(
     total_steps: int = 2880,
     hourly_step_interval: int = 4,
-    human_step_interval: int = 96,
-    target_cpa: float = 50.0,
-    initial_max_bid: float = 2.50,
+    human_step_interval: int = 48,
+    target_cpa: float = 80.0,
+    initial_max_bid: float = 5.00,
     initial_daily_budget: float = 1000.0,
 ) -> Tuple[dict, dict]:
     """
@@ -67,7 +67,7 @@ def run_industry_baseline_simulation(
                 # Else: within band → no change
 
         # ------------------------------------------------------------------
-        # Loop B: Human Intervener (Manual) – every 24 virtual hours
+        # Loop B: Human Intervener (Manual) – every 12 virtual hours
         # ------------------------------------------------------------------
         if (step + 1) % human_step_interval == 0:
             # Look back over the last 24 hours (96 steps) of history.
