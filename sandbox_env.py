@@ -47,7 +47,12 @@ class SandboxEnv:
         """
         # 1) VolatilityScheduler updates ν in the state.
         current_hour = self.state.current_hour
-        v = self.scheduler.get_v_multiplier(current_hour)
+        sched_result = self.scheduler.get_v_multiplier(current_hour)
+
+        # Support both legacy float return values and the new dict format
+        # {"v": float, "event": str}.
+        v = float(sched_result["v"])
+
         self.state.set_volatility(v)
 
         # 2) MarketPhysics consumes state and records outcomes via StateManager.

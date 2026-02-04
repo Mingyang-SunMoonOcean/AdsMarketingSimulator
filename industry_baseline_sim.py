@@ -4,72 +4,183 @@ from typing import Tuple
 
 from sandbox_env import SandboxEnv
 
+from volatility_scheduler import VolatilityScheduler
+
+
+
+# ---------------------------------------------------------------------------
+# Global configuration constants for the Industry Baseline
+# ---------------------------------------------------------------------------
+
+# Simulation timing
+STEP_MINUTES = 15
+HOURS_PER_DAY = 24
+STEPS_PER_HOUR = int(60 / STEP_MINUTES)          # 4
+TOTAL_DAYS = 30
+TOTAL_STEPS = TOTAL_DAYS * HOURS_PER_DAY * STEPS_PER_HOUR  # 2,880
+
+# Control loop frequencies
+HOURLY_STEP_INTERVAL = STEPS_PER_HOUR            # 1 virtual hour
+HUMAN_STEP_INTERVAL = 48                         # 12 virtual hours (current spec)
+
+# Proportional rule parameters
+LOOKBACK_STEPS = 96          # 24 hours
+MIN_CLICKS_REQUIRED = 10     # avoid reacting to noise
+BID_FLOOR = 0.50             # never go below this
+BID_CEILING = 25.00          # protect against runaway bids
+TARGET_CPA_CHF = 80.0
+
+# Initial config for the baseline
+INITIAL_MAX_BID = 5.00
+INITIAL_DAILY_BUDGET = 1000.0
+
+# Human intervener (website crash & holiday) parameters
+CRASH_START_HOUR = 120
+CRASH_END_HOUR = 168
+HOLIDAY_START_HOUR = 300
+HOLIDAY_END_HOUR = 468
+
+HOLIDAY_DAILY_BUDGET = 1000.0
+BASELINE_MAX_BID = 6.50
+
 def apply_proportional_rule(env: SandboxEnv, obs: dict, target_cpa: float) -> None:
     """
-    Loop A: Proportional Rule (Automation).
-
-    - If CPA > target_cpa: reduce max_bid by 5%.
-    - If CPA < 0.8 * target_cpa: increase max_bid by 2%.
-    - If leads == 0: keep max_bid unchanged (blind spot).
+    Realistic Hybrid Rule Engine:
+    1. Lookback Window: Uses a rolling 24-hour average to smooth noise.
+    2. Statistical Significance: Only acts if there is enough data (min_clicks).
+    3. Efficiency Rule: Lowers bid if CPA is too high.
+    4. Volume Rule: Aggressively increases bid if CPA is low AND spend is under-pacing.
+    5. Inventory Guard: Prevents bids from dropping below a floor or exceeding a ceiling.
     """
-    latest = obs.get("latest_outcome") or {}
-    leads = int(latest.get("leads", 0))
 
-    # Edge case: no leads → cannot compute CPA; status quo
-    if leads <= 0:
-        return
-
-    cpa = float(latest.get("cpa", 0.0))
-    max_bid = float(obs.get("max_bid", 0.0))
-
-    if cpa > target_cpa:
-        new_max_bid = max_bid * 0.95  # -5%
-        env.configure(max_bid=new_max_bid)
-    elif cpa < target_cpa * 0.8:
-        new_max_bid = max_bid * 1.02  # +2%
-        env.configure(max_bid=new_max_bid)
-    # Else: within acceptable band → no change
-
-
-def apply_human_intervener(env: SandboxEnv, window_steps: int) -> None:
-    """
-    Loop B: Human Intervener (Manual).
-
-    - Reviews the last `window_steps` outcomes (typically 24h window).
-    - If total spend > 0 and total leads == 0: assumes critical failure and
-      sets max_bid to 0.01 (emergency pause).
-    """
-    history = env.state.state.history
+    # 1. Extract historical data from the rolling window
+    history = obs.get("history", [])[-LOOKBACK_STEPS:]
     if not history:
         return
 
-    window = history[-window_steps:]
+    # 2. Calculate aggregate metrics over the window
+    total_spend = sum(h.get("spend", 0.0) for h in history)
+    total_leads = sum(h.get("leads", 0) for h in history)
+    total_clicks = sum(h.get("clicks", 0) for h in history)
 
-    total_spend = sum(float(r.get("spend", 0.0)) for r in window)
-    total_leads = sum(int(r.get("leads", 0)) for r in window)
+    current_max_bid = float(obs.get("max_bid", 0.0))
 
-    if total_spend > 0.0 and total_leads == 0:
-        env.configure(max_bid=0.01)
+    # 3. Statistical guardrail – do nothing if we don't have enough data
+    if total_clicks < MIN_CLICKS_REQUIRED:
+        return
 
+    # 4. Calculate rolling CPA
+    avg_cpa = total_spend / total_leads if total_leads > 0 else float("inf")
+
+    # 5. Core logic: efficiency vs volume
+    new_max_bid = current_max_bid
+
+    # Scenario A: CPA is too high (efficiency lever)
+    if avg_cpa > target_cpa * 1.2:
+        # Aggressive cut if way over target
+        new_max_bid = current_max_bid * 0.70
+    elif avg_cpa > target_cpa:
+        # Minor correction
+        new_max_bid = current_max_bid * 0.95
+
+    # Scenario B: CPA is very good (volume/scale lever)
+    elif avg_cpa < target_cpa * 0.8:
+        daily_budget = float(obs.get("daily_budget", 0.0))
+        # If profitable AND not hitting budget, bid up to get more volume
+        if total_spend < (daily_budget * 0.8):
+            new_max_bid = current_max_bid * 1.10  # scale up 10%
+        else:
+            new_max_bid = current_max_bid * 1.02  # scale up gently 2%
+
+    # Scenario C: No leads despite significant spend (safety lever)
+    elif total_leads == 0 and total_spend > (target_cpa * 2):
+        new_max_bid = current_max_bid * 0.50
+
+    # Enforce physical boundaries
+    new_max_bid = max(BID_FLOOR, min(new_max_bid, BID_CEILING))
+
+    # Execute only if there's a meaningful change
+    if round(new_max_bid, 2) != round(current_max_bid, 2):
+        env.configure(max_bid=new_max_bid)
+
+
+def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: VolatilityScheduler):
+    """
+    Smarter Marketer Implementation: 
+    1. Weekly Efficiency Review (7-day cycle)
+    2. Event-based Alerting (4h/2h lag)
+    3. Monthly Budget Reset (30-day cycle)
+    """
+    obs = env.observe()
+    history = obs.get("history", [])
+    
+    # --- A. WEEKLY EFFICIENCY REVIEW (Every 168 Hours / 7 Days) ---
+    if current_hour > 0 and current_hour % 168 == 0:
+        # Look at the last 7 days (672 steps)
+        weekly_history = history[-672:]
+        if weekly_history:
+            total_spend = sum(h.get("spend", 0.0) for h in weekly_history)
+            total_leads = sum(h.get("leads", 0) for h in weekly_history)
+            weekly_cpa = total_spend / total_leads if total_leads > 0 else float('inf')
+
+            print(f"[Human Weekly Review] Hour {current_hour}: Analyzing past 7 days. Weekly CPA: {weekly_cpa:.2f}")
+
+            # RECALIBRATION: If inefficient, cut budget to 'Efficiency Floor'
+            if weekly_cpa > TARGET_CPA_CHF * 1.2:
+                print(f"  -> CPA too high. Reducing budget by 30% to force efficiency.")
+                env.configure(daily_budget=obs["daily_budget"] * 0.7)
+            
+            # RECALIBRATION: If very efficient, scale up to capture more volume
+            elif weekly_cpa < TARGET_CPA_CHF * 0.8:
+                print(f"  -> High efficiency detected. Increasing budget by 20% to scale.")
+                env.configure(daily_budget=obs["daily_budget"] * 1.2)
+
+    # --- B. EVENT-BASED ALERTS (Asymmetric / Reactive) ---
+    condition = scheduler.get_v_multiplier(current_hour)
+    event = condition["event"]
+
+    # 4-hour lag for Crash Detection
+    if event == "CRASH" and current_hour >= (CRASH_START_HOUR + 4):
+        if obs.get("max_bid") > 0.01:
+            print(f"[Human Alert] Hour {current_hour}: Received site-down alert. Pausing ads.")
+            env.configure(max_bid=0.01)
+
+    # 2-hour lag for Recovery Verification
+    if event == "NORMAL" and current_hour >= (CRASH_END_HOUR + 2):
+        if obs.get("max_bid") < 0.50:
+            print(f"[Human Alert] Hour {current_hour}: Verified recovery. Resuming at 50% safety budget.")
+            env.configure(daily_budget=INITIAL_DAILY_BUDGET * 0.5, max_bid=INITIAL_MAX_BID)
+
+    # --- C. STRATEGIC CALENDAR (Anticipatory) ---
+    # Holiday Start: 24h lead time to increase budget
+    if current_hour == (HOLIDAY_START_HOUR - 24):
+        print(f"[Human Strategy] Hour {current_hour}: Preparing for holiday. Setting aggressive budget.")
+        env.configure(daily_budget=HOLIDAY_DAILY_BUDGET)
+
+    # Holiday End: 12h cooldown to reset
+    if current_hour == (HOLIDAY_END_HOUR + 12):
+        print(f"[Human Strategy] Hour {current_hour}: Holiday over. Resetting to baseline for efficiency.")
+        env.configure(daily_budget=INITIAL_DAILY_BUDGET)
 
 def run_industry_baseline_simulation(
-    total_steps: int = 2880,
-    hourly_step_interval: int = 4,
-    human_step_interval: int = 48,
-    target_cpa: float = 80.0,
-    initial_max_bid: float = 5.00,
-    initial_daily_budget: float = 1000.0,
+    total_steps: int = TOTAL_STEPS,
+    hourly_step_interval: int = HOURLY_STEP_INTERVAL,
+    human_step_interval: int = HUMAN_STEP_INTERVAL,
+    target_cpa: float = TARGET_CPA_CHF,
+    initial_max_bid: float = INITIAL_MAX_BID,
+    initial_daily_budget: float = INITIAL_DAILY_BUDGET,
 ) -> Tuple[dict, dict]:
     """
-    Run the 30‑day (2,880‑step) "Industry Baseline" simulation.
+    Run the 30-day (2,880-step) "Industry Baseline" simulation.
 
     Two control loops operate on the same SandboxEnv instance:
     - Loop A (Proportional Rule): every virtual hour (every 4 steps).
-    - Loop B (Human Intervener): every 24 virtual hours (every 96 steps).
+    - Loop B (Human Intervener): every `human_step_interval` steps.
 
     Returns a tuple of (final_state, aggregate_metrics).
     """
-    env = SandboxEnv()
+    scheduler = VolatilityScheduler()
+    env = SandboxEnv(scheduler=scheduler)
 
     # Initial configuration
     env.configure(daily_budget=initial_daily_budget, max_bid=initial_max_bid)
@@ -80,7 +191,7 @@ def run_industry_baseline_simulation(
     total_clicks = 0
 
     for step in range(total_steps):
-        # Advance simulation by one 15‑minute step
+        # Advance simulation by one 15-minute step
         outcome = env.act()
 
         # Update aggregates
@@ -97,7 +208,8 @@ def run_industry_baseline_simulation(
 
         # Loop B: Human Intervener (Manual)
         if (step + 1) % human_step_interval == 0:
-            apply_human_intervener(env, human_step_interval)
+            current_hour = env.state.current_hour
+            apply_human_intervener(env, current_hour, scheduler)
 
     final_state = env.observe()
     aggregate_metrics = {

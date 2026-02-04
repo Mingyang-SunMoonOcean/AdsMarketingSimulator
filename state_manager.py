@@ -20,7 +20,7 @@ class SimulationState:
     step_index: int = 0
     latest_outcome: dict[str, Any] | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
-
+    budget_status: str = "normal"
 
 class StateManager:
     """
@@ -107,6 +107,25 @@ class StateManager:
         minute = self.state.current_minute
         hour = self.current_hour
         day = self.current_day
+        daily_budget = self.state.daily_budget
+
+        # Update budget status
+        # Sum today's spend from history (same day)
+        today_spend = sum(
+            float(r.get("spend", 0.0))
+            for r in self.state.history
+            if r.get("day") == day
+        )
+        # Include the current step's spend
+        today_spend += float(outcome.get("spend", 0.0))
+
+        # Determine budget status
+        if today_spend >= daily_budget:
+            budget_status = "budget_depleted"
+        elif today_spend >= 0.9 * daily_budget:
+            budget_status = "budget_constrained"
+        else:
+            budget_status = "normal"
 
         record: dict[str, Any] = {
             "step_index": self.state.step_index,
@@ -116,6 +135,7 @@ class StateManager:
             "daily_budget": self.state.daily_budget,
             "max_bid": self.state.max_bid,
             "volatility": self.state.volatility,
+            "budget_status": budget_status,
         }
         record.update(outcome)
 
@@ -124,6 +144,8 @@ class StateManager:
         self.state.history.append(record)
         self.state.step_index += 1
         self.state.current_minute += self.step_minutes
+        self.state.budget_status = budget_status
+
 
         # Persist to CSV "database"
         self._append_to_csv(record)
@@ -157,5 +179,6 @@ class StateManager:
         base = self.get_inputs()
         base["step_index"] = self.state.step_index
         base["latest_outcome"] = self.state.latest_outcome
+        base["history"] = self.state.history
         return base
 

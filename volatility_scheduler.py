@@ -7,14 +7,14 @@ class VolatilityScheduler:
 
     def get_v_multiplier(self, hour: int) -> float:
         hour = int(hour)
-
+        
         # Scenario 1: Website Crash (Hours 120-168)
         if 120 <= hour <= 168:
-            return 0.0  # Zero conversions
+            return {"v": 0.0, "event": "CRASH"}
 
-        # Scenario 2: Competitor Entry (Hour 300 - 468, holiday season) 
+        # Scenario 2: Holiday/Competitor Entry (Hours 300-468)
         if 300 <= hour <= 468:
-            return 0.7  # 30% drop in efficiency due to competition
+            return {"v": 0.7, "event": "HOLIDAY"}
 
-        return 1.0  # Normal conditions
+        return {"v": 0.95, "event": "NORMAL"}
 
