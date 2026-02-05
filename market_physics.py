@@ -16,8 +16,8 @@ class MarketPhysics:
         cpc_max: float = 20.00,
         cvr_base: float = 0.025,
         k: float = 1.2,
-        # simulate 1 click per step (every 15 minutes)
-        base_clicks: float = 1.0,
+        # simulate 5 click per step (every 15 minutes)
+        base_clicks: float = 5.0,
     ):
         # Market constants
         self.CPC_base = float(cpc_base)
