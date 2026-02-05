@@ -84,9 +84,9 @@ def apply_proportional_rule(env: SandboxEnv, obs: dict, target_cpa: float) -> No
     efficiency_multiplier = 1.0
     if total_leads > 0:
         avg_cpa = total_spend / total_leads
-        if avg_cpa > target_cpa * 1.4:
+        if avg_cpa > target_cpa * 1.2:
             efficiency_multiplier = 0.85 # Aggressive cut
-        elif avg_cpa > target_cpa * 1.2:
+        elif avg_cpa > target_cpa:
             efficiency_multiplier = 0.95 # Minor trim
         elif avg_cpa < target_cpa * 0.8:
             efficiency_multiplier = 1.10 # Scale up
@@ -116,7 +116,7 @@ def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: Volati
     history = obs.get("history", [])
 
 
-    # --- A.DAILY ROUNTINE CHECK (Every 12 Hours) ---
+    # --- A. DAILY ROUTINE CHECK (Every 12 Hours) ---
     history_24h = obs.get("history", [])[-96:]
     if history_24h:
         rolling_spend = sum(h.get("spend", 0.0) for h in history_24h)
@@ -124,7 +124,7 @@ def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: Volati
             print(f"[Human Audit] Hour {current_hour}: Low utilization detected. Resetting bid to {INITIAL_MAX_BID}.")
             env.configure(max_bid=INITIAL_MAX_BID)
 
-    # --- A. WEEKLY EFFICIENCY REVIEW (Every 168 Hours / 7 Days) ---
+    # --- B. WEEKLY EFFICIENCY REVIEW (Every 168 Hours / 7 Days) ---
     if current_hour > 0 and current_hour % 168 == 0:
         # Look at the last 7 days (672 steps)
         weekly_history = history[-672:]
@@ -145,7 +145,7 @@ def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: Volati
                 print(f"  -> High efficiency detected. Increasing budget by 20% to scale.")
                 env.configure(daily_budget=obs["daily_budget"] * 1.2)
 
-    # --- B. EVENT-BASED ALERTS (Asymmetric / Reactive) ---
+    # --- C. EVENT-BASED ALERTS (Asymmetric / Reactive) ---
     condition = scheduler.get_v_multiplier(current_hour)
     event = condition["event"]
 
@@ -161,7 +161,7 @@ def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: Volati
             print(f"[Human Alert] Hour {current_hour}: Verified recovery. Resuming at 50% safety budget.")
             env.configure(daily_budget=INITIAL_DAILY_BUDGET * 0.5, max_bid=INITIAL_MAX_BID)
 
-    # --- C. STRATEGIC CALENDAR (Anticipatory) ---
+    # --- D. STRATEGIC CALENDAR (Anticipatory) ---
     # Holiday Start: 24h lead time to increase budget
     if current_hour == (HOLIDAY_START_HOUR - 24):
         print(f"[Human Strategy] Hour {current_hour}: Preparing for holiday. Setting aggressive budget.")
