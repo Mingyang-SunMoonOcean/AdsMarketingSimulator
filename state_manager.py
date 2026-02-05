@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+# Budget pacing constants
+STEPS_PER_HOUR = 4          # 60 min / 15 min per step
+ROLLING_24H_STEPS = 96      # 24 hours * 4 steps/hour
+
 @dataclass
 class SimulationState:
     """
@@ -74,11 +78,17 @@ class StateManager:
         """
         Returns the current configuration and time snapshot used by the physics.
         """
+        day = self.current_day
+        cumulative_budget = self.state.daily_budget * day
+        total_spend = sum(float(r.get("spend", 0.0)) for r in self.state.history)
+
         return {
             "minute": self.state.current_minute,
             "hour": self.current_hour,
-            "day": self.current_day,
+            "day": day,
             "daily_budget": self.state.daily_budget,
+            "cumulative_budget": cumulative_budget,
+            "total_spend": total_spend,
             "max_bid": self.state.max_bid,
             "volatility": self.state.volatility,
         }
@@ -103,26 +113,34 @@ class StateManager:
         - Stores in memory.
         - Appends to a local CSV file.
         - Advances simulation time by `step_minutes`.
+
+        Budget model:
+        - Cumulative budget grows by `daily_budget` every 24 hours.
+        - Pacing is checked against a rolling 24-hour spend window.
         """
         minute = self.state.current_minute
         hour = self.current_hour
         day = self.current_day
         daily_budget = self.state.daily_budget
 
-        # Update budget status
-        # Sum today's spend from history (same day)
-        today_spend = sum(
-            float(r.get("spend", 0.0))
-            for r in self.state.history
-            if r.get("day") == day
-        )
-        # Include the current step's spend
-        today_spend += float(outcome.get("spend", 0.0))
+        # Cumulative budget: grows by daily_budget each day
+        cumulative_budget = daily_budget * day
 
-        # Determine budget status
-        if today_spend >= daily_budget:
+        # Total spend across the entire simulation
+        total_spend = sum(float(r.get("spend", 0.0)) for r in self.state.history)
+        total_spend += float(outcome.get("spend", 0.0))
+
+        # Rolling 24-hour spend (for pacing visibility)
+        rolling_24h_spend = sum(
+            float(r.get("spend", 0.0))
+            for r in self.state.history[-ROLLING_24H_STEPS:]
+        )
+        rolling_24h_spend += float(outcome.get("spend", 0.0))
+
+        # Determine budget status based on cumulative budget
+        if total_spend >= cumulative_budget:
             budget_status = "budget_depleted"
-        elif today_spend >= 0.9 * daily_budget:
+        elif total_spend >= 0.9 * cumulative_budget:
             budget_status = "budget_constrained"
         else:
             budget_status = "normal"
@@ -133,6 +151,9 @@ class StateManager:
             "hour": hour,
             "day": day,
             "daily_budget": self.state.daily_budget,
+            "cumulative_budget": round(cumulative_budget, 4),
+            "total_spend": round(total_spend, 4),
+            "rolling_24h_spend": round(rolling_24h_spend, 4),
             "max_bid": self.state.max_bid,
             "volatility": self.state.volatility,
             "budget_status": budget_status,

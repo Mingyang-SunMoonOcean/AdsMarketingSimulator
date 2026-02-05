@@ -64,38 +64,39 @@ def apply_proportional_rule(env: SandboxEnv, obs: dict, target_cpa: float) -> No
     total_clicks = sum(h.get("clicks", 0) for h in history)
 
     current_max_bid = float(obs.get("max_bid", 0.0))
+    daily_budget = float(obs.get("daily_budget", 0.0))
 
     # 3. Statistical guardrail – do nothing if we don't have enough data
     if total_clicks < MIN_CLICKS_REQUIRED:
         return
+    
+    # --- A. ROLLING PACING MULTIPLIER ---
+    # We treat the 'daily_budget' as the target spend for any 24h window.
+    pacing_multiplier = 1.0
+    if total_spend < (daily_budget * 0.85):
+        # Under-spending over the last 24h: increase bid to find volume
+        pacing_multiplier = 1.10
+    elif total_spend > (daily_budget * 1.10):
+        # Over-spending over the last 24h: decrease bid to conserve
+        pacing_multiplier = 0.90
 
-    # 4. Calculate rolling CPA
-    avg_cpa = total_spend / total_leads if total_leads > 0 else float("inf")
-
-    # 5. Core logic: efficiency vs volume
-    new_max_bid = current_max_bid
-
-    # Scenario A: CPA is too high (efficiency lever)
-    if avg_cpa > target_cpa * 1.2:
-        # Aggressive cut if way over target
-        new_max_bid = current_max_bid * 0.70
-    elif avg_cpa > target_cpa:
-        # Minor correction
-        new_max_bid = current_max_bid * 0.95
-
-    # Scenario B: CPA is very good (volume/scale lever)
-    elif avg_cpa < target_cpa * 0.8:
-        daily_budget = float(obs.get("daily_budget", 0.0))
-        # If profitable AND not hitting budget, bid up to get more volume
-        if total_spend < (daily_budget * 0.8):
-            new_max_bid = current_max_bid * 1.10  # scale up 10%
-        else:
-            new_max_bid = current_max_bid * 1.02  # scale up gently 2%
-
-    # Scenario C: No leads despite significant spend (safety lever)
-    elif total_leads == 0 and total_spend > (target_cpa * 2):
-        new_max_bid = current_max_bid * 0.50
-
+    # --- B. ROLLING EFFICIENCY MULTIPLIER ---
+    efficiency_multiplier = 1.0
+    if total_leads > 0:
+        avg_cpa = total_spend / total_leads
+        if avg_cpa > target_cpa * 1.2:
+            efficiency_multiplier = 0.85 # Aggressive cut
+        elif avg_cpa > target_cpa:
+            efficiency_multiplier = 0.95 # Minor trim
+        elif avg_cpa < target_cpa * 0.8:
+            efficiency_multiplier = 1.10 # Scale up
+    else:
+        # Death Spiral Protection: Only cut if we spent > 2x target with 0 leads
+        if total_spend > (target_cpa * 1.8):
+            efficiency_multiplier = 0.80
+        
+    new_max_bid = current_max_bid * pacing_multiplier * efficiency_multiplier
+ 
     # Enforce physical boundaries
     new_max_bid = max(BID_FLOOR, min(new_max_bid, BID_CEILING))
 
@@ -113,8 +114,17 @@ def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: Volati
     """
     obs = env.observe()
     history = obs.get("history", [])
-    
-    # --- A. WEEKLY EFFICIENCY REVIEW (Every 168 Hours / 7 Days) ---
+
+
+    # --- A. DAILY ROUTINE CHECK (Every 12 Hours) ---
+    history_24h = obs.get("history", [])[-96:]
+    if history_24h:
+        rolling_spend = sum(h.get("spend", 0.0) for h in history_24h)
+        if rolling_spend < (obs["daily_budget"] * 0.5):
+            print(f"[Human Audit] Hour {current_hour}: Low utilization detected. Resetting bid to {INITIAL_MAX_BID}.")
+            env.configure(max_bid=INITIAL_MAX_BID)
+
+    # --- B. WEEKLY EFFICIENCY REVIEW (Every 168 Hours / 7 Days) ---
     if current_hour > 0 and current_hour % 168 == 0:
         # Look at the last 7 days (672 steps)
         weekly_history = history[-672:]
@@ -135,7 +145,7 @@ def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: Volati
                 print(f"  -> High efficiency detected. Increasing budget by 20% to scale.")
                 env.configure(daily_budget=obs["daily_budget"] * 1.2)
 
-    # --- B. EVENT-BASED ALERTS (Asymmetric / Reactive) ---
+    # --- C. EVENT-BASED ALERTS (Asymmetric / Reactive) ---
     condition = scheduler.get_v_multiplier(current_hour)
     event = condition["event"]
 
@@ -151,7 +161,7 @@ def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: Volati
             print(f"[Human Alert] Hour {current_hour}: Verified recovery. Resuming at 50% safety budget.")
             env.configure(daily_budget=INITIAL_DAILY_BUDGET * 0.5, max_bid=INITIAL_MAX_BID)
 
-    # --- C. STRATEGIC CALENDAR (Anticipatory) ---
+    # --- D. STRATEGIC CALENDAR (Anticipatory) ---
     # Holiday Start: 24h lead time to increase budget
     if current_hour == (HOLIDAY_START_HOUR - 24):
         print(f"[Human Strategy] Hour {current_hour}: Preparing for holiday. Setting aggressive budget.")
