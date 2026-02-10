@@ -291,7 +291,7 @@ if __name__ == "__main__":
 
     ## the state history is 37 days but only the last 30 days are effective
 
-    write_to_csv("industry_baseline_simulation_results.csv", effective_state_history)
+    write_to_csv("ib_simulation_results.csv", effective_state_history)
 
     latest = effective_state_history[-1] if effective_state_history else None
     print("=== Industry Baseline Simulation (30 days) ===")
