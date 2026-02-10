@@ -1,3 +1,5 @@
+WEBSITE_CRASH_HOURS = [288, 432]
+HOLIDAY_HOURS = [468, 624]
 
 class VolatilityScheduler:
     """
@@ -9,12 +11,12 @@ class VolatilityScheduler:
         hour = int(hour)
         
         # Scenario 1: Website Crash (Hours 288 - 432)
-        if 288 <= hour <= 432:
+        if WEBSITE_CRASH_HOURS[0] <= hour <= WEBSITE_CRASH_HOURS[1]:
             return {"v": 0.0, "event": "CRASH"}
 
         # Scenario 2: Holiday/Competitor Entry (Hours 468-624)
-        if 468 <= hour <= 624:
+        if HOLIDAY_HOURS[0] <= hour <= HOLIDAY_HOURS[1]:
             return {"v": 0.7, "event": "HOLIDAY"}
 
-        return {"v": 0.95, "event": "NORMAL"}
+        return {"v": 1.0, "event": "NORMAL"}
 
