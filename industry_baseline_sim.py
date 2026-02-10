@@ -91,8 +91,8 @@ def apply_proportional_rule(env: SandboxEnv, obs: dict, target_cpa: float) -> No
         elif avg_cpa < target_cpa * 0.8:
             efficiency_multiplier = 1.10 # Scale up
     else:
-        # Death Spiral Protection: Only cut if we spent > 2x target with 0 leads
-        if total_spend > (target_cpa * 1.8):
+        # Death Spiral Protection: Only cut if we spent > 1.5x target with 0 leads
+        if total_spend > (target_cpa * 1.5):
             efficiency_multiplier = 0.80
         
     new_max_bid = current_max_bid * pacing_multiplier * efficiency_multiplier
