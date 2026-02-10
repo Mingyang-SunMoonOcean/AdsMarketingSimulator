@@ -1,30 +1,51 @@
 from __future__ import annotations
 
-import csv
-import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Tuple
 
+from world_clock import WorldClock
 
 # Budget pacing constants
 STEPS_PER_HOUR = 4          # 60 min / 15 min per step
 ROLLING_24H_STEPS = 96      # 24 hours * 4 steps/hour
 
 @dataclass
+class BizInputs:
+    daily_budget: float = 0.0
+    max_bid: float = 0.0
+
+@dataclass
+class ExternalEventsInputs:
+    volatility: float = 1.0
+
+@dataclass
+class MarketOutcome:
+    #timestamp
+    current_minute: int = 0
+    current_hour: int = 0
+    current_day: int = 0
+    clicks: int = 0
+    leads: int = 0
+    spend: float = 0.0
+    cpa: float = 0.0
+    realized_cpc: float = 0.0
+
+@dataclass
+class DerivedVariables:
+    budget_status: str = "normal"
+    current_day_spend: float = 0.0
+
+@dataclass
 class SimulationState:
     """
     Core simulation state, managed centrally by StateManager.
-    Time is tracked in minutes, with each step advancing by a fixed interval.
-    """
 
-    current_minute: int = 0
-    daily_budget: float = 0.0
-    max_bid: float = 0.0
-    volatility: float = 1.0
-    step_index: int = 0
-    latest_outcome: dict[str, Any] | None = None
-    history: list[dict[str, Any]] = field(default_factory=list)
-    budget_status: str = "normal"
+    Time is **not** stored here -- it lives in the shared ``WorldClock``.
+    """
+    biz_inputs: BizInputs = field(default_factory=BizInputs)
+    external_events_inputs: ExternalEventsInputs = field(default_factory=ExternalEventsInputs)
+    market_outcome: MarketOutcome = field(default_factory=MarketOutcome)
+    derived_variables: DerivedVariables = field(default_factory=DerivedVariables)
 
 class StateManager:
     """
@@ -33,74 +54,56 @@ class StateManager:
     - Agents **write** configuration (budget / max bid) here.
     - VolatilityScheduler **writes** the current volatility multiplier here.
     - MarketPhysics **reads** inputs from here and **writes** outcomes back.
-    - Outcomes are timestamped in minutes (every `step_minutes`, starting from 0)
-      and appended to an in-memory history and a local CSV "database".
-    - When an agent "observes" the environment, the latest outcome is returned.
+    - Outcomes are timestamped and appended to an in-memory state history.
+    - When an agent "observes" the environment, the full state history is returned.
     """
 
     def __init__(
         self,
+        clock: WorldClock,
         daily_budget: float = 1000.0,
-        step_minutes: int = 15,
-        minutes_per_day: int = 60 * 24,
-        results_csv_path: str = "simulation_results.csv",
     ) -> None:
-        self.step_minutes = int(step_minutes)
-        self.minutes_per_day = int(minutes_per_day)
-        self.results_csv_path = results_csv_path
+        self.clock = clock
 
-        # Optionally reset the results CSV at the start of a new run.
-        # This ensures that each simulation instance writes a fresh timeline.
-        if os.path.exists(self.results_csv_path):
-            os.remove(self.results_csv_path)
-
-        self.state = SimulationState(daily_budget=float(daily_budget))
+        self.state = SimulationState(
+            biz_inputs=BizInputs(daily_budget=float(daily_budget)),
+        )
+        self.state_history: list[SimulationState] = []
 
     # ------------------------------------------------------------------
     # Configuration writes (from operating agent via API)
     # ------------------------------------------------------------------
     def set_daily_budget(self, daily_budget: float) -> None:
-        self.state.daily_budget = float(daily_budget)
+        self.state.biz_inputs.daily_budget = float(daily_budget)
 
     def set_max_bid(self, max_bid: float) -> None:
-        self.state.max_bid = float(max_bid)
+        self.state.biz_inputs.max_bid = float(max_bid)
 
     # ------------------------------------------------------------------
     # Volatility writes (from VolatilityScheduler via SandboxEnv)
     # ------------------------------------------------------------------
     def set_volatility(self, v_multiplier: float) -> None:
-        self.state.volatility = float(v_multiplier)
+        self.state.external_events_inputs.volatility = float(v_multiplier)
 
     # ------------------------------------------------------------------
     # Reads used by MarketPhysics / VolatilityScheduler
     # ------------------------------------------------------------------
-    def get_inputs(self) -> dict[str, Any]:
+    def get_inputs(self) -> Tuple[BizInputs, ExternalEventsInputs]:
         """
-        Returns the current configuration and time snapshot used by the physics.
+        Returns the current biz inputs and external event inputs
+        used by the physics engine.
         """
-        day = self.current_day
-        cumulative_budget = self.state.daily_budget * day
-        total_spend = sum(float(r.get("spend", 0.0)) for r in self.state.history)
-
-        return {
-            "minute": self.state.current_minute,
-            "hour": self.current_hour,
-            "day": day,
-            "daily_budget": self.state.daily_budget,
-            "cumulative_budget": cumulative_budget,
-            "total_spend": total_spend,
-            "max_bid": self.state.max_bid,
-            "volatility": self.state.volatility,
-        }
+        return self.state.biz_inputs, self.state.external_events_inputs
 
     @property
     def current_hour(self) -> int:
-        return self.state.current_minute // 60
+        """Delegate to the shared WorldClock."""
+        return self.clock.current_hour
 
     @property
     def current_day(self) -> int:
-        # Day index starting from 0; expose as 1-based to callers.
-        return (self.state.current_minute // self.minutes_per_day) + 1
+        """Delegate to the shared WorldClock."""
+        return self.clock.current_day
 
     # ------------------------------------------------------------------
     # Outcomes written by MarketPhysics
@@ -109,97 +112,84 @@ class StateManager:
         """
         Record a single step outcome.
 
-        - Stamps it with time (minute/hour/day) and a monotonically increasing step index.
-        - Stores in memory.
-        - Appends to a local CSV file.
-        - Advances simulation time by `step_minutes`.
+        - Stamps it with time (minute/hour/day) from the shared WorldClock.
+        - Wraps raw outcome values in a ``MarketOutcome`` dataclass.
+        - Updates ``DerivedVariables`` (budget_status, current_day_spend).
+        - Creates a **snapshot** of the full ``SimulationState`` and appends
+          it to ``state_history``.
+        - Advances the WorldClock by one tick.
 
         Budget model:
-        - Cumulative budget grows by `daily_budget` every 24 hours.
-        - Pacing is checked against a rolling 24-hour spend window.
+        - Budget is checked per calendar day against ``daily_budget``.
         """
-        minute = self.state.current_minute
-        hour = self.current_hour
-        day = self.current_day
-        daily_budget = self.state.daily_budget
+        minute = self.clock.current_minute
+        hour = self.clock.current_hour
+        day = self.clock.current_day
+        daily_budget = self.state.biz_inputs.daily_budget
 
-        # Cumulative budget: grows by daily_budget each day
-        cumulative_budget = daily_budget * day
-
-        # Total spend across the entire simulation
-        total_spend = sum(float(r.get("spend", 0.0)) for r in self.state.history)
-        total_spend += float(outcome.get("spend", 0.0))
-
-        # Rolling 24-hour spend (for pacing visibility)
-        rolling_24h_spend = sum(
-            float(r.get("spend", 0.0))
-            for r in self.state.history[-ROLLING_24H_STEPS:]
+        # Current calendar-day spend (including this step)
+        current_day_spend = sum(
+            s.market_outcome.spend
+            for s in self.state_history
+            if s.market_outcome.current_day == day
         )
-        rolling_24h_spend += float(outcome.get("spend", 0.0))
+        step_spend = float(outcome.get("spend", 0.0))
+        current_day_spend += step_spend
 
-        # Determine budget status based on cumulative budget
-        if total_spend >= cumulative_budget:
+        # Determine budget status for the current day
+        if current_day_spend >= daily_budget:
             budget_status = "budget_depleted"
-        elif total_spend >= 0.9 * cumulative_budget:
+        elif current_day_spend >= 0.9 * daily_budget:
             budget_status = "budget_constrained"
         else:
             budget_status = "normal"
 
-        record: dict[str, Any] = {
-            "step_index": self.state.step_index,
-            "minute": minute,
-            "hour": hour,
-            "day": day,
-            "daily_budget": self.state.daily_budget,
-            "cumulative_budget": round(cumulative_budget, 4),
-            "total_spend": round(total_spend, 4),
-            "rolling_24h_spend": round(rolling_24h_spend, 4),
-            "max_bid": self.state.max_bid,
-            "volatility": self.state.volatility,
-            "budget_status": budget_status,
-        }
-        record.update(outcome)
+        # Build typed MarketOutcome
+        market_outcome = MarketOutcome(
+            current_minute=minute,
+            current_hour=hour,
+            current_day=day,
+            clicks=int(outcome.get("clicks", 0)),
+            leads=int(outcome.get("leads", 0)),
+            spend=round(step_spend, 4),
+            cpa=round(float(outcome.get("cpa", 0.0)), 4),
+            realized_cpc=round(float(outcome.get("realized_cpc", 0.0)), 4),
+        )
 
-        # Update in-memory state
-        self.state.latest_outcome = record
-        self.state.history.append(record)
-        self.state.step_index += 1
-        self.state.current_minute += self.step_minutes
-        self.state.budget_status = budget_status
+        # Update live state
+        self.state.market_outcome = market_outcome
+        self.state.derived_variables.budget_status = budget_status
+        self.state.derived_variables.current_day_spend = round(current_day_spend, 4)
 
+        # Append an immutable *snapshot* so history entries don't alias
+        snapshot = SimulationState(
+            biz_inputs=BizInputs(
+                daily_budget=self.state.biz_inputs.daily_budget,
+                max_bid=self.state.biz_inputs.max_bid,
+            ),
+            external_events_inputs=ExternalEventsInputs(
+                volatility=self.state.external_events_inputs.volatility,
+            ),
+            market_outcome=market_outcome,
+            derived_variables=DerivedVariables(
+                budget_status=budget_status,
+                current_day_spend=round(current_day_spend, 4),
+            ),
+        )
+        self.state_history.append(snapshot)
 
-        # Persist to CSV "database"
-        self._append_to_csv(record)
-
-    def _append_to_csv(self, record: dict[str, Any]) -> None:
-        """
-        Append a single record to the CSV file, creating it with a header
-        if it does not yet exist.
-        """
-        file_exists = os.path.exists(self.results_csv_path)
-
-        # Ensure deterministic column order
-        fieldnames = list(record.keys())
-
-        with open(self.results_csv_path, mode="a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(record)
+        # Advance the shared world clock
+        self.clock.tick()
 
     # ------------------------------------------------------------------
     # Reads used by operating agent (API)
     # ------------------------------------------------------------------
-    def observe(self) -> dict[str, Any]:
+    def observe(self) -> list[SimulationState]:
         """
-        Return the latest observable state for agents.
+        Return the full state history for agents.
 
-        - Always includes current time and config fields.
-        - If no outcome has been produced yet, `latest_outcome` will be None.
+        Each entry is a ``SimulationState`` snapshot taken at the end of
+        that step.  The last element is the most recent.
         """
-        base = self.get_inputs()
-        base["step_index"] = self.state.step_index
-        base["latest_outcome"] = self.state.latest_outcome
-        base["history"] = self.state.history
-        return base
+        return self.state_history
 

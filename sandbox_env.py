@@ -3,12 +3,15 @@ from __future__ import annotations
 from market_physics import MarketPhysics
 from state_manager import StateManager
 from volatility_scheduler import VolatilityScheduler
+from world_clock import WorldClock
 
 
 class SandboxEnv:
     """
     Wrapper / interaction surface for agents and APIs.
     This is the single entry point for observing state and taking actions.
+
+    Owns the shared ``WorldClock`` that every sub-system reads from.
     """
 
     def __init__(
@@ -16,12 +19,14 @@ class SandboxEnv:
         physics: MarketPhysics | None = None,
         state: StateManager | None = None,
         scheduler: VolatilityScheduler | None = None,
+        clock: WorldClock | None = None,
     ):
-        self.state = state or StateManager()
+        self.clock = clock or WorldClock()
+        self.state = state or StateManager(clock=self.clock)
         self.physics = physics or MarketPhysics()
         self.scheduler = scheduler or VolatilityScheduler()
 
-    def observe(self) -> dict:
+    def observe(self) -> list:
         return self.state.observe()
 
     # ------------------------------------------------------------------
@@ -43,10 +48,11 @@ class SandboxEnv:
         - VolatilityScheduler **writes** ν into the StateManager.
         - MarketPhysics **reads** budget / max_bid / ν from the StateManager
           and **writes** outcomes back (with timestamps every 15 minutes).
+        - The WorldClock is advanced inside ``StateManager.record_outcome()``.
         - The latest outcome is returned to the caller.
         """
-        # 1) VolatilityScheduler updates ν in the state.
-        current_hour = self.state.current_hour
+        # 1) VolatilityScheduler updates ν in the state (reads time from clock).
+        current_hour = self.clock.current_hour
         sched_result = self.scheduler.get_v_multiplier(current_hour)
 
         # Support both legacy float return values and the new dict format
