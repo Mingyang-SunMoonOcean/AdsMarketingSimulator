@@ -1,0 +1,3 @@
+- Clean up code
+- Add a "warm-up" 7 day period which is not included in the simulation result to keep the history
+- Add the utility calculation function

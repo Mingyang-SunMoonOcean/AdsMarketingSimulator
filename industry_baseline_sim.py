@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Tuple
+import os
+
+import csv
+from typing import Any, List, Tuple
 
 from sandbox_env import SandboxEnv
-
+from state_manager import SimulationState
 from volatility_scheduler import VolatilityScheduler
-
 
 
 # ---------------------------------------------------------------------------
@@ -16,8 +18,9 @@ from volatility_scheduler import VolatilityScheduler
 STEP_MINUTES = 15
 HOURS_PER_DAY = 24
 STEPS_PER_HOUR = int(60 / STEP_MINUTES)          # 4
-TOTAL_DAYS = 30
-TOTAL_STEPS = TOTAL_DAYS * HOURS_PER_DAY * STEPS_PER_HOUR  # 2,880
+TOTAL_DAYS = 37
+TOTAL_STEPS = TOTAL_DAYS * HOURS_PER_DAY * STEPS_PER_HOUR  # 3,552
+EFFECTIVE_STEPS = 30 * HOURS_PER_DAY * STEPS_PER_HOUR  # 2,880
 
 # Control loop frequencies
 HOURLY_STEP_INTERVAL = STEPS_PER_HOUR            # 1 virtual hour
@@ -27,7 +30,7 @@ HUMAN_STEP_INTERVAL = 48                         # 12 virtual hours (current spe
 LOOKBACK_STEPS = 96          # 24 hours
 MIN_CLICKS_REQUIRED = 10     # avoid reacting to noise
 BID_FLOOR = 0.50             # never go below this
-BID_CEILING = 25.00          # protect against runaway bids
+BID_CEILING = 20.00          # protect against runaway bids
 TARGET_CPA_CHF = 80.0
 
 # Initial config for the baseline
@@ -43,7 +46,12 @@ HOLIDAY_END_HOUR = 468
 HOLIDAY_DAILY_BUDGET = 1000.0
 BASELINE_MAX_BID = 6.50
 
-def apply_proportional_rule(env: SandboxEnv, obs: dict, target_cpa: float) -> None:
+
+def apply_proportional_rule(
+    env: SandboxEnv,
+    state_history: List[SimulationState],
+    target_cpa: float,
+) -> None:
     """
     Realistic Hybrid Rule Engine:
     1. Lookback Window: Uses a rolling 24-hour average to smooth noise.
@@ -54,22 +62,24 @@ def apply_proportional_rule(env: SandboxEnv, obs: dict, target_cpa: float) -> No
     """
 
     # 1. Extract historical data from the rolling window
-    history = obs.get("history", [])[-LOOKBACK_STEPS:]
-    if not history:
+    window = state_history[-LOOKBACK_STEPS:]
+    if not window:
         return
 
     # 2. Calculate aggregate metrics over the window
-    total_spend = sum(h.get("spend", 0.0) for h in history)
-    total_leads = sum(h.get("leads", 0) for h in history)
-    total_clicks = sum(h.get("clicks", 0) for h in history)
+    total_spend = sum(s.market_outcome.spend for s in window)
+    total_leads = sum(s.market_outcome.leads for s in window)
+    total_clicks = sum(s.market_outcome.clicks for s in window)
 
-    current_max_bid = float(obs.get("max_bid", 0.0))
-    daily_budget = float(obs.get("daily_budget", 0.0))
+    # Current config from the latest state snapshot
+    latest = state_history[-1]
+    current_max_bid = latest.biz_inputs.max_bid
+    daily_budget = latest.biz_inputs.daily_budget
 
     # 3. Statistical guardrail – do nothing if we don't have enough data
     if total_clicks < MIN_CLICKS_REQUIRED:
         return
-    
+
     # --- A. ROLLING PACING MULTIPLIER ---
     # We treat the 'daily_budget' as the target spend for any 24h window.
     pacing_multiplier = 1.0
@@ -84,19 +94,21 @@ def apply_proportional_rule(env: SandboxEnv, obs: dict, target_cpa: float) -> No
     efficiency_multiplier = 1.0
     if total_leads > 0:
         avg_cpa = total_spend / total_leads
-        if avg_cpa > target_cpa * 1.2:
-            efficiency_multiplier = 0.85 # Aggressive cut
+        if avg_cpa >= target_cpa * 1.3:
+            efficiency_multiplier = 0.75  # Aggressive cut
+        elif avg_cpa >= target_cpa * 1.1:
+            efficiency_multiplier = 0.85  # Moderate cut
         elif avg_cpa > target_cpa:
-            efficiency_multiplier = 0.95 # Minor trim
+            efficiency_multiplier = 0.95  # Minor trim
         elif avg_cpa < target_cpa * 0.8:
-            efficiency_multiplier = 1.10 # Scale up
+            efficiency_multiplier = 1.10  # Scale up
     else:
         # Death Spiral Protection: Only cut if we spent > 1.5x target with 0 leads
         if total_spend > (target_cpa * 1.5):
-            efficiency_multiplier = 0.80
-        
+            efficiency_multiplier = 0.70
+
     new_max_bid = current_max_bid * pacing_multiplier * efficiency_multiplier
- 
+
     # Enforce physical boundaries
     new_max_bid = max(BID_FLOOR, min(new_max_bid, BID_CEILING))
 
@@ -105,32 +117,38 @@ def apply_proportional_rule(env: SandboxEnv, obs: dict, target_cpa: float) -> No
         env.configure(max_bid=new_max_bid)
 
 
-def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: VolatilityScheduler):
+def apply_human_intervener(
+    env: SandboxEnv,
+    current_hour: int,
+    scheduler: VolatilityScheduler,
+) -> None:
     """
-    Smarter Marketer Implementation: 
+    Smarter Marketer Implementation:
     1. Weekly Efficiency Review (7-day cycle)
     2. Event-based Alerting (4h/2h lag)
     3. Monthly Budget Reset (30-day cycle)
     """
-    obs = env.observe()
-    history = obs.get("history", [])
+    state_history: List[SimulationState] = env.observe()
+    if not state_history:
+        return
 
+    latest = state_history[-1]
 
     # --- A. DAILY ROUTINE CHECK (Every 12 Hours) ---
-    history_24h = obs.get("history", [])[-96:]
+    history_24h = state_history[-96:]
     if history_24h:
-        rolling_spend = sum(h.get("spend", 0.0) for h in history_24h)
-        if rolling_spend < (obs["daily_budget"] * 0.5):
+        rolling_spend = sum(s.market_outcome.spend for s in history_24h)
+        if rolling_spend < (latest.biz_inputs.daily_budget * 0.5):
             print(f"[Human Audit] Hour {current_hour}: Low utilization detected. Resetting bid to {INITIAL_MAX_BID}.")
             env.configure(max_bid=INITIAL_MAX_BID)
 
     # --- B. WEEKLY EFFICIENCY REVIEW (Every 168 Hours / 7 Days) ---
     if current_hour > 0 and current_hour % 168 == 0:
         # Look at the last 7 days (672 steps)
-        weekly_history = history[-672:]
+        weekly_history = state_history[-672:]
         if weekly_history:
-            total_spend = sum(h.get("spend", 0.0) for h in weekly_history)
-            total_leads = sum(h.get("leads", 0) for h in weekly_history)
+            total_spend = sum(s.market_outcome.spend for s in weekly_history)
+            total_leads = sum(s.market_outcome.leads for s in weekly_history)
             weekly_cpa = total_spend / total_leads if total_leads > 0 else float('inf')
 
             print(f"[Human Weekly Review] Hour {current_hour}: Analyzing past 7 days. Weekly CPA: {weekly_cpa:.2f}")
@@ -138,12 +156,12 @@ def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: Volati
             # RECALIBRATION: If inefficient, cut budget to 'Efficiency Floor'
             if weekly_cpa > TARGET_CPA_CHF * 1.2:
                 print(f"  -> CPA too high. Reducing budget by 30% to force efficiency.")
-                env.configure(daily_budget=obs["daily_budget"] * 0.7)
-            
+                env.configure(daily_budget=latest.biz_inputs.daily_budget * 0.7)
+
             # RECALIBRATION: If very efficient, scale up to capture more volume
             elif weekly_cpa < TARGET_CPA_CHF * 0.8:
                 print(f"  -> High efficiency detected. Increasing budget by 20% to scale.")
-                env.configure(daily_budget=obs["daily_budget"] * 1.2)
+                env.configure(daily_budget=latest.biz_inputs.daily_budget * 1.2)
 
     # --- C. EVENT-BASED ALERTS (Asymmetric / Reactive) ---
     condition = scheduler.get_v_multiplier(current_hour)
@@ -151,13 +169,13 @@ def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: Volati
 
     # 4-hour lag for Crash Detection
     if event == "CRASH" and current_hour >= (CRASH_START_HOUR + 4):
-        if obs.get("max_bid") > 0.01:
+        if latest.biz_inputs.max_bid > 0.01:
             print(f"[Human Alert] Hour {current_hour}: Received site-down alert. Pausing ads.")
             env.configure(max_bid=0.01)
 
     # 2-hour lag for Recovery Verification
     if event == "NORMAL" and current_hour >= (CRASH_END_HOUR + 2):
-        if obs.get("max_bid") < 0.50:
+        if latest.biz_inputs.max_bid < 0.50:
             print(f"[Human Alert] Hour {current_hour}: Verified recovery. Resuming at 50% safety budget.")
             env.configure(daily_budget=INITIAL_DAILY_BUDGET * 0.5, max_bid=INITIAL_MAX_BID)
 
@@ -172,6 +190,7 @@ def apply_human_intervener(env: SandboxEnv, current_hour: int, scheduler: Volati
         print(f"[Human Strategy] Hour {current_hour}: Holiday over. Resetting to baseline for efficiency.")
         env.configure(daily_budget=INITIAL_DAILY_BUDGET)
 
+
 def run_industry_baseline_simulation(
     total_steps: int = TOTAL_STEPS,
     hourly_step_interval: int = HOURLY_STEP_INTERVAL,
@@ -179,15 +198,15 @@ def run_industry_baseline_simulation(
     target_cpa: float = TARGET_CPA_CHF,
     initial_max_bid: float = INITIAL_MAX_BID,
     initial_daily_budget: float = INITIAL_DAILY_BUDGET,
-) -> Tuple[dict, dict]:
+) -> Tuple[List[SimulationState], dict]:
     """
-    Run the 30-day (2,880-step) "Industry Baseline" simulation.
+    Run the 37-day "Industry Baseline" simulation.
 
     Two control loops operate on the same SandboxEnv instance:
     - Loop A (Proportional Rule): every virtual hour (every 4 steps).
     - Loop B (Human Intervener): every `human_step_interval` steps.
 
-    Returns a tuple of (final_state, aggregate_metrics).
+    Returns a tuple of (state_history, aggregate_metrics).
     """
     scheduler = VolatilityScheduler()
     env = SandboxEnv(scheduler=scheduler)
@@ -195,33 +214,27 @@ def run_industry_baseline_simulation(
     # Initial configuration
     env.configure(daily_budget=initial_daily_budget, max_bid=initial_max_bid)
 
-    # Aggregates for reporting
-    total_spend = 0.0
-    total_leads = 0
-    total_clicks = 0
-
     for step in range(total_steps):
         # Advance simulation by one 15-minute step
-        outcome = env.act()
+        env.act()
 
-        # Update aggregates
-        total_spend += float(outcome.get("spend", 0.0))
-        total_leads += int(outcome.get("leads", 0))
-        total_clicks += int(outcome.get("clicks", 0))
-
-        # Observe current state (includes latest_outcome and config)
-        obs = env.observe()
+        # Observe current state history
+        state_history = env.observe()
 
         # Loop A: Proportional Rule (Automation)
         if (step + 1) % hourly_step_interval == 0:
-            apply_proportional_rule(env, obs, target_cpa)
+            apply_proportional_rule(env, state_history, target_cpa)
 
         # Loop B: Human Intervener (Manual)
         if (step + 1) % human_step_interval == 0:
-            current_hour = env.state.current_hour
+            current_hour = env.clock.current_hour
             apply_human_intervener(env, current_hour, scheduler)
 
-    final_state = env.observe()
+    state_history = env.observe()
+    effective_state_history = state_history[-EFFECTIVE_STEPS:]
+    total_spend = sum(s.market_outcome.spend for s in effective_state_history)
+    total_leads = sum(s.market_outcome.leads for s in effective_state_history)
+    total_clicks = sum(s.market_outcome.clicks for s in effective_state_history)
     aggregate_metrics = {
         "total_spend": round(total_spend, 4),
         "total_leads": int(total_leads),
@@ -229,17 +242,64 @@ def run_industry_baseline_simulation(
         "overall_cpa": round(total_spend / total_leads, 4) if total_leads > 0 else None,
     }
 
-    return final_state, aggregate_metrics
+    return effective_state_history, aggregate_metrics
+
+
+def write_to_csv(results_csv_path: str, state_history: List[SimulationState]) -> None:
+    """
+    Write the full state history to a CSV file.
+
+    Columns: day, hour, minute, clicks, leads, spend, cpa, realized_cpc,
+             daily_budget, max_bid, volatility, budget_status, current_day_spend.
+    """
+    if os.path.exists(results_csv_path):
+        os.remove(results_csv_path)
+
+    if not state_history:
+        return
+
+    fieldnames = [
+        "current_day", "current_hour", "current_minute",
+        "clicks", "leads", "spend", "cpa", "realized_cpc",
+        "daily_budget", "max_bid", "volatility",
+        "budget_status", "current_day_spend",
+    ]
+
+    with open(results_csv_path, mode="w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for s in state_history:
+            writer.writerow({
+                "current_day": s.market_outcome.current_day,
+                "current_hour": s.market_outcome.current_hour,
+                "current_minute": s.market_outcome.current_minute,
+                "clicks": s.market_outcome.clicks,
+                "leads": s.market_outcome.leads,
+                "spend": s.market_outcome.spend,
+                "cpa": s.market_outcome.cpa,
+                "realized_cpc": s.market_outcome.realized_cpc,
+                "daily_budget": s.biz_inputs.daily_budget,
+                "max_bid": s.biz_inputs.max_bid,
+                "volatility": s.external_events_inputs.volatility,
+                "budget_status": s.derived_variables.budget_status,
+                "current_day_spend": s.derived_variables.current_day_spend,
+            })
 
 
 if __name__ == "__main__":
-    final_state, metrics = run_industry_baseline_simulation()
+    effective_state_history, metrics = run_industry_baseline_simulation()
 
+    ## the state history is 37 days but only the last 30 days are effective
+
+    write_to_csv("industry_baseline_simulation_results.csv", effective_state_history)
+
+    latest = effective_state_history[-1] if effective_state_history else None
     print("=== Industry Baseline Simulation (30 days) ===")
-    print(f"Final virtual day: {final_state.get('day')}")
-    print(f"Final virtual hour: {final_state.get('hour')}")
-    print(f"Final max_bid: {final_state.get('max_bid')}")
-    print(f"Final daily_budget: {final_state.get('daily_budget')}")
+    if latest:
+        print(f"Final virtual day: {latest.market_outcome.current_day}")
+        print(f"Final virtual hour: {latest.market_outcome.current_hour}")
+        print(f"Final max_bid: {latest.biz_inputs.max_bid}")
+        print(f"Final daily_budget: {latest.biz_inputs.daily_budget}")
     print("--- Aggregates ---")
     print(f"Total spend: {metrics['total_spend']}")
     print(f"Total leads: {metrics['total_leads']}")

@@ -1,5 +1,17 @@
 import numpy as np
 
+# Market physics constants for a premium car dealership.
+# CPC_base: base CPC for the car dealership.
+CPC_BASE = 2.00
+# CPC_max: max CPC for the car dealership.
+CPC_MAX = 12.00
+# CVR_base: base CVR for the car dealership.
+CVR_BASE = 0.025
+# k: decay rate for the CPC.
+K = 1.2
+# base_clicks: base number of clicks for the car dealership (every 15 minutes).
+BASE_CLICKS = 5.0
+
 
 class MarketPhysics:
     """
@@ -12,12 +24,12 @@ class MarketPhysics:
 
     def __init__(
         self,
-        cpc_base: float = 2.00,
-        cpc_max: float = 20.00,
-        cvr_base: float = 0.025,
-        k: float = 1.2,
+        cpc_base: float = CPC_BASE,
+        cpc_max: float = CPC_MAX,
+        cvr_base: float = CVR_BASE,
+        k: float = K,
         # simulate 5 click per step (every 15 minutes)
-        base_clicks: float = 5.0,
+        base_clicks: float = BASE_CLICKS,
     ):
         # Market constants
         self.CPC_base = float(cpc_base)
@@ -31,13 +43,16 @@ class MarketPhysics:
         Read inputs from the state manager, generate stochastic outcomes,
         and write them back to the state manager with a timestamp.
         """
-        inputs = state_manager.get_inputs()
-        b_max = float(inputs["max_bid"])
-        v_multiplier = float(inputs["volatility"])
-        history = state_manager.state.history
+        biz_inputs, external_events_inputs = state_manager.get_inputs()
+        b_max = float(biz_inputs.max_bid)
+        v_multiplier = float(external_events_inputs.volatility)
+        daily_budget = float(biz_inputs.daily_budget)
+        current_day_spend = float(
+            state_manager.state.derived_variables.current_day_spend
+        )
 
-        # Check last 24 hours of spend
-        if state_manager.state.budget_status == "budget_depleted":
+        # Check budget status (derived variable)
+        if state_manager.state.derived_variables.budget_status == "budget_depleted":
             outcome = {
                 "realized_cpc": 0.0,
                 "spend": 0.0,
@@ -75,8 +90,16 @@ class MarketPhysics:
 
         # 3) Spend and leads
         spend = float(clicks) * float(cpc_act)
+
+        # Cap spend at remaining daily budget so we never overshoot
+        remaining_daily = daily_budget - current_day_spend
+        if spend > remaining_daily:
+            spend = max(remaining_daily, 0.0)
+            clicks = spend / cpc_act if cpc_act > 0 else 0.0
+            clicks = int(clicks)
+
         cvr_effective = self.CVR_base * v_multiplier
-        leads = np.random.binomial(n=int(clicks), p=max(cvr_effective, 0.0))
+        leads = np.random.binomial(n=int(clicks), p=min(max(cvr_effective, 0.0), 1.0))
 
         outcome = {
             "realized_cpc": round(float(cpc_act), 4),
