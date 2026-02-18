@@ -114,4 +114,3 @@ class MarketPhysics:
         # Write through to StateManager (single source of truth)
         state_manager.record_outcome(outcome)
         return outcome
-

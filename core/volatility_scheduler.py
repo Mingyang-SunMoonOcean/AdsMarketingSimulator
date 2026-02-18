@@ -19,4 +19,3 @@ class VolatilityScheduler:
             return {"v": 0.7, "event": "HOLIDAY"}
 
         return {"v": 1.0, "event": "NORMAL"}
-
