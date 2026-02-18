@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Tuple
 
-from world_clock import WorldClock
+from .world_clock import WorldClock
 
 # Budget pacing constants
 STEPS_PER_HOUR = 4          # 60 min / 15 min per step
@@ -192,4 +192,3 @@ class StateManager:
         that step.  The last element is the most recent.
         """
         return self.state_history
-

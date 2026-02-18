@@ -1,14 +1,17 @@
+"""API interface to Sandbox for OODA MAS agents."""
+
 from typing import Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from sandbox_env import SandboxEnv
+from core.sandbox_env import SandboxEnv
 
 
 class ConfigInput(BaseModel):
     daily_budget: Optional[float] = None
     max_bid: Optional[float] = None
+
 
 def create_app(env: Optional[SandboxEnv] = None) -> FastAPI:
     """
@@ -38,3 +41,27 @@ def create_app(env: Optional[SandboxEnv] = None) -> FastAPI:
         return env.act()
 
     return app
+
+
+class Executor:
+    """
+    Executor agent: interfaces with the Sandbox via API or direct calls.
+
+    In simulation mode, holds a reference to SandboxEnv and calls
+    configure() / observe() directly. In API mode, makes HTTP requests.
+    """
+
+    def __init__(self, env: SandboxEnv):
+        self.env = env
+
+    def observe(self):
+        """Observe current state from the sandbox."""
+        return self.env.observe()
+
+    def configure(self, daily_budget: Optional[float] = None, max_bid: Optional[float] = None):
+        """Write configuration to the sandbox."""
+        self.env.configure(daily_budget=daily_budget, max_bid=max_bid)
+
+    def act(self):
+        """Advance simulation by one step (typically called by simulation driver)."""
+        return self.env.act()

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from market_physics import MarketPhysics
-from state_manager import StateManager
-from volatility_scheduler import VolatilityScheduler
-from world_clock import WorldClock
+from .market_physics import MarketPhysics
+from .state_manager import StateManager
+from .volatility_scheduler import VolatilityScheduler
+from .world_clock import WorldClock
 
 
 class SandboxEnv:
@@ -64,4 +64,3 @@ class SandboxEnv:
         # 2) MarketPhysics consumes state and records outcomes via StateManager.
         outcome = self.physics.run_step(self.state)
         return outcome
-

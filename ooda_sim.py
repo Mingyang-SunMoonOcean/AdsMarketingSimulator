@@ -1,4 +1,4 @@
-"""Entry point to run Industry Baseline simulation."""
+"""Entry point to run Phase 2 OODA MAS simulation."""
 
 from __future__ import annotations
 
@@ -10,72 +10,70 @@ from typing import List, Tuple
 from core.sandbox_env import SandboxEnv
 from core.state_manager import SimulationState
 from core.volatility_scheduler import VolatilityScheduler
-from baseline.rule_engine import apply_proportional_rule
-from baseline.legacy_human import apply_human_intervener
+from agents.analyst import Analyst
+from agents.strategist import Strategist
+from agents.executor import Executor
+from agents.human_supervisor import HumanSupervisor
 
 
 # ---------------------------------------------------------------------------
-# Global configuration constants for the Industry Baseline
+# Configuration (mirror Industry Baseline for comparability)
 # ---------------------------------------------------------------------------
-
-# Simulation timing
 STEP_MINUTES = 15
 HOURS_PER_DAY = 24
-STEPS_PER_HOUR = int(60 / STEP_MINUTES)          # 4
+STEPS_PER_HOUR = int(60 / STEP_MINUTES)
 TOTAL_DAYS = 37
-TOTAL_STEPS = TOTAL_DAYS * HOURS_PER_DAY * STEPS_PER_HOUR  # 3,552
-EFFECTIVE_STEPS = 30 * HOURS_PER_DAY * STEPS_PER_HOUR  # 2,880
+TOTAL_STEPS = TOTAL_DAYS * HOURS_PER_DAY * STEPS_PER_HOUR
+EFFECTIVE_STEPS = 30 * HOURS_PER_DAY * STEPS_PER_HOUR
 
-# Control loop frequencies
-HOURLY_STEP_INTERVAL = STEPS_PER_HOUR            # 1 virtual hour
-HUMAN_STEP_INTERVAL = 48                         # 12 virtual hours (current spec)
-
-# Proportional rule parameters
-TARGET_CPA_CHF = 80.0
-
-# Initial config for the baseline
 INITIAL_MAX_BID = 5.00
 INITIAL_DAILY_BUDGET = 1000.0
 
 
-def run_industry_baseline_simulation(
+def run_ooda_simulation(
     total_steps: int = TOTAL_STEPS,
-    hourly_step_interval: int = HOURLY_STEP_INTERVAL,
-    human_step_interval: int = HUMAN_STEP_INTERVAL,
-    target_cpa: float = TARGET_CPA_CHF,
     initial_max_bid: float = INITIAL_MAX_BID,
     initial_daily_budget: float = INITIAL_DAILY_BUDGET,
 ) -> Tuple[List[SimulationState], dict]:
     """
-    Run the 37-day "Industry Baseline" simulation.
+    Run the OODA MAS simulation (Phase 2).
 
-    Two control loops operate on the same SandboxEnv instance:
-    - Loop A (Proportional Rule): every virtual hour (every 4 steps).
-    - Loop B (Human Intervener): every `human_step_interval` steps.
+    Uses Analyst (observation), Strategist (policy + shadow pricing),
+    Executor (sandbox interface), and Human Supervisor (3-7 day guidance).
 
     Returns a tuple of (state_history, aggregate_metrics).
     """
     scheduler = VolatilityScheduler()
     env = SandboxEnv(scheduler=scheduler)
 
-    # Initial configuration
+    analyst = Analyst()
+    strategist = Strategist()
+    executor = Executor(env)
+    human_supervisor = HumanSupervisor()
+
     env.configure(daily_budget=initial_daily_budget, max_bid=initial_max_bid)
 
     for step in range(total_steps):
-        # Advance simulation by one 15-minute step
         env.act()
-
-        # Observe current state history
         state_history = env.observe()
 
-        # Loop A: Proportional Rule (Automation)
-        if (step + 1) % hourly_step_interval == 0:
-            apply_proportional_rule(env, state_history, target_cpa)
+        # OODA loop (placeholder: agents are stubs; Executor already has config)
+        observation = analyst.observe(state_history)
+        current_hour = env.clock.current_hour
+        current_day = (current_hour // 24) + 1
 
-        # Loop B: Human Intervener (Manual)
-        if (step + 1) % human_step_interval == 0:
-            current_hour = env.clock.current_hour
-            apply_human_intervener(env, current_hour, scheduler)
+        # Human Supervisor: 3-7 day cadence (e.g., every 5 days)
+        guidance = None
+        if current_day > 0 and current_day % 5 == 0:
+            guidance = human_supervisor.get_guidance(current_day, observation)
+
+        # Strategist: policy selection
+        policy = strategist.select_policy(observation, guidance)
+        if policy:
+            if "max_bid" in policy:
+                executor.configure(max_bid=policy["max_bid"])
+            if "daily_budget" in policy:
+                executor.configure(daily_budget=policy["daily_budget"])
 
     state_history = env.observe()
     effective_state_history = state_history[-EFFECTIVE_STEPS:]
@@ -93,12 +91,7 @@ def run_industry_baseline_simulation(
 
 
 def write_to_csv(results_csv_path: str, state_history: List[SimulationState]) -> None:
-    """
-    Write the full state history to a CSV file.
-
-    Columns: day, hour, minute, clicks, leads, spend, cpa, realized_cpc,
-             daily_budget, max_bid, volatility, budget_status, current_day_spend.
-    """
+    """Write state history to CSV."""
     os.makedirs(os.path.dirname(results_csv_path) or ".", exist_ok=True)
     if os.path.exists(results_csv_path):
         os.remove(results_csv_path)
@@ -135,16 +128,14 @@ def write_to_csv(results_csv_path: str, state_history: List[SimulationState]) ->
 
 
 if __name__ == "__main__":
-    effective_state_history, metrics = run_industry_baseline_simulation()
+    effective_state_history, metrics = run_ooda_simulation()
 
-    # Output to data/ib_results.csv per structure.md
-    write_to_csv("data/ib_results.csv", effective_state_history)
+    write_to_csv("data/mas_results.csv", effective_state_history)
 
     latest = effective_state_history[-1] if effective_state_history else None
-    print("=== Industry Baseline Simulation (30 days) ===")
+    print("=== OODA MAS Simulation (Phase 2, 30 days) ===")
     if latest:
         print(f"Final virtual day: {latest.market_outcome.current_day}")
-        print(f"Final virtual hour: {latest.market_outcome.current_hour}")
         print(f"Final max_bid: {latest.biz_inputs.max_bid}")
         print(f"Final daily_budget: {latest.biz_inputs.daily_budget}")
     print("--- Aggregates ---")
