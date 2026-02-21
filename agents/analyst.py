@@ -28,7 +28,7 @@ class Analyst:
         shared_knowledge_path: str,
         policy_path: str,
         log_path: str = "logs/analyst_log.jsonl",
-        model: str = "gpt-4o-mini"
+        model: str = "gpt-4.1-nano"
     ):
         load_dotenv()
         print(f"Key loaded: {os.getenv('OPENAI_API_KEY')[:5]}...")
