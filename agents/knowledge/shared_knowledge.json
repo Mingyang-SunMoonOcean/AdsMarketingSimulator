@@ -1,0 +1,115 @@
+{
+    "_meta": {
+      "name": "OODA MAS Shared Knowledge Database",
+      "version": "1.0",
+      "description": "This database stores contextual, historical, and environmental knowledge used during the Orient phase of the OODA loop. It provides memory and pattern recognition to support reasoning before action."
+    },
+  
+    "baseline_environment": {
+      "target_cpa": 80.0,
+      "baseline_cvr": 0.025,
+      "baseline_cpc": 2.0,
+      "market_ceiling_cpc": 20.0,
+      "saturation_constant_k": 1.2,
+      "description": "Represents the healthy steady-state environment for Zurich Premium Auto."
+    },
+  
+    "market_patterns": [
+      {
+        "pattern_id": "holiday_surge",
+        "description": "Seasonal surge in demand (e.g., holiday period).",
+        "expected_cvr_multiplier": 1.3,
+        "expected_cpc_increase_percent": 20,
+        "recommended_strategy": "Increase bids gradually while monitoring CPA.",
+        "risk_note": "Avoid excessive aggression; CPC rises with demand."
+      },
+      {
+        "pattern_id": "landing_page_failure",
+        "description": "Technical issue causes sudden CVR collapse.",
+        "expected_cvr_multiplier": 0.2,
+        "cpa_behavior": "CPA spikes sharply.",
+        "recommended_strategy": "Pause campaign to prevent leakage.",
+        "risk_note": "Continuing to spend during outage creates toxic spend."
+      },
+      {
+        "pattern_id": "competitive_bid_spike",
+        "description": "Competitors increase bids, raising CPC.",
+        "expected_cpc_increase_percent": 30,
+        "cvr_behavior": "Stable CVR but rising CPA.",
+        "recommended_strategy": "Evaluate marginal CPA impact before raising bids."
+      },
+      {
+        "pattern_id": "normal_noise",
+        "description": "Gaussian fluctuation in CPC or CVR.",
+        "expected_duration_hours": 1,
+        "recommended_strategy": "Wait for confirmation before action.",
+        "risk_note": "Overreaction reduces long-term utility."
+      }
+    ],
+  
+    "historical_incidents": [
+      {
+        "incident_id": "cvr_crash_overreaction",
+        "description": "System reduced bids too aggressively due to 1-hour CVR drop.",
+        "lesson_learned": "Require confirmation window before major actions.",
+        "impact": "Lost volume during quick recovery."
+      },
+      {
+        "incident_id": "late_day_underspend",
+        "description": "System prioritized CPA efficiency too long and failed to finish budget.",
+        "lesson_learned": "Shadow price λ must dominate late in the day.",
+        "impact": "Utility loss from unused capital."
+      },
+      {
+        "incident_id": "holiday_underbidding",
+        "description": "System failed to scale during high CVR surge.",
+        "lesson_learned": "Increase bids cautiously during confirmed surges.",
+        "impact": "Missed conversion opportunity."
+      }
+    ],
+  
+    "efficiency_relationships": {
+      "cpa_sensitivity": "CPA is inversely proportional to CVR.",
+      "leakage_condition": "When CPA > target and CVR < baseline, spend is toxic.",
+      "bid_volume_tradeoff": "Lower bids reduce CPA but risk inventory loss.",
+      "budget_scaling_penalty": "As spend approaches daily cap, CPC increases due to saturation."
+    },
+  
+    "utility_intuition": {
+      "lead_value": 500.0,
+      "holiday_bonus_value": 100.0,
+      "cpa_penalty_weight": 5.0,
+      "leakage_penalty_weight": 1.5,
+      "interpretation": "The system values profitable leads highly but punishes inefficient and toxic spending."
+    },
+  
+    "volatility_regimes": [
+      {
+        "regime": "stable",
+        "cvr_multiplier_range": [0.9, 1.1],
+        "recommended_behavior": "Optimize gradually."
+      },
+      {
+        "regime": "negative_shock",
+        "cvr_multiplier_range": [0.0, 0.6],
+        "recommended_behavior": "Defensive posture; protect capital."
+      },
+      {
+        "regime": "positive_surge",
+        "cvr_multiplier_range": [1.3, 2.0],
+        "recommended_behavior": "Aggressive but controlled scaling."
+      }
+    ],
+  
+    "noise_model_assumptions": {
+      "distribution": "Gaussian",
+      "implication": "Short-term metric spikes may not indicate structural change.",
+      "recommended_confirmation_hours": 1
+    },
+  
+    "stakeholder_expectations": {
+      "marketer_focus": "CPA stability and lead quality.",
+      "executive_focus": "Total profit and budget utilization.",
+      "system_requirement": "All decisions must produce reasoning logs for audit."
+    }
+}
