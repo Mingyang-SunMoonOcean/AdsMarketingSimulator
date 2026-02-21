@@ -1,0 +1,111 @@
+{
+  "_meta": {
+    "name": "OODA MAS Thesis Policy Database",
+    "version": "1.0",
+    "purpose": "This Policy Database defines the behavioral constraints and optimization objective of the Multi-Agent System. It ensures that the Strategist maximizes the total optimization function F = U - λ·P while respecting efficiency, pacing, volatility response, and risk boundaries."
+  },
+  "optimization_objective": {
+    "description": "The system must maximize F = U - λ·P.",
+    "utility_definition": "U = volume_score - cpa_penalty - leakage_penalty",
+    "volume_score": {
+      "alpha_value_per_lead": 500,
+      "holiday_bonus_per_lead": 100,
+      "explanation": "Each lead is worth CHF 500. During holiday periods, each lead receives an additional CHF 100 bonus."
+    },
+    "cpa_penalty": {
+      "beta_penalty_weight": 5,
+      "target_cpa": 80,
+      "formula": "5 × |actual_CPA - 80|",
+      "explanation": "Deviation from target CPA reduces utility. Larger inefficiencies are penalized proportionally."
+    },
+    "leakage_penalty": {
+      "gamma_multiplier": 1.5,
+      "base_cvr": 0.025,
+      "activation_condition": "Only applies when actual_CPA > 80",
+      "logic": "If conversion rate drops below baseline and CPA exceeds target, spending is considered toxic and penalized proportionally to spend and performance gap."
+    },
+    "budget_penalty": {
+      "definition": "P = |actual_hourly_spend - expected_hourly_budget|",
+      "expected_hourly_budget": "daily_budget / 24",
+      "shadow_price_lambda": "λ = exp(current_hour / 24)",
+      "explanation": "Budget deviation is penalized increasingly throughout the day. Early hours prioritize performance; late hours prioritize full budget utilization."
+    }
+  },
+  "cpa_efficiency_policy": {
+    "target_cpa": 80,
+    "acceptable_deviation_band": 10,
+    "hard_efficiency_threshold": 120,
+    "policy_logic": [
+      "If CPA slightly above target → reduce bids gradually.",
+      "If CPA significantly above target → reduce bids aggressively.",
+      "If CPA remains above hard threshold for multiple hours → escalate."
+    ]
+  },
+  "budget_pacing_policy": {
+    "objective": "Spend the full daily budget without large hourly deviations.",
+    "overspend_tolerance_percent": 5,
+    "underspend_tolerance_percent": 10,
+    "late_day_priority_increase": true,
+    "policy_logic": [
+      "Early in the day → prioritize CPA efficiency.",
+      "Late in the day → prioritize spending remaining budget.",
+      "Avoid large underspending unless CPA protection requires it."
+    ]
+  },
+  "volatility_response_policy": {
+    "baseline_cvr": 0.025,
+    "moderate_drop_threshold_percent": 40,
+    "severe_drop_threshold_percent": 70,
+    "positive_surge_multiplier": 1.3,
+    "policy_logic": [
+      "If CVR drops moderately → reduce bids.",
+      "If CVR drops severely → pause campaign to prevent leakage.",
+      "If CVR surges significantly → increase bids cautiously.",
+      "Confirm volatility before major actions."
+    ]
+  },
+  "risk_appetite_policy": {
+    "mode": "balanced",
+    "max_bid_change_per_hour_percent": 30,
+    "max_consecutive_aggressive_moves": 3,
+    "policy_logic": [
+      "Avoid extreme bid swings.",
+      "Prefer gradual adjustments.",
+      "Protect capital before chasing volume."
+    ]
+  },
+  "escalation_policy": {
+    "conditions_for_escalation": [
+      "CPA above 120 for more than 3 hours.",
+      "Campaign paused for more than 6 hours.",
+      "Budget deviation exceeds 20%."
+    ],
+    "action": "Notify human supervisor.",
+    "purpose": "Prevent autonomous drift and maintain trust."
+  },
+  "noise_protection_policy": {
+    "minimum_confirmation_hours": 1,
+    "policy_logic": [
+      "Do not react to single-hour anomalies.",
+      "Require persistence before large bid or pause decisions."
+    ]
+  },
+  "execution_constraints": {
+    "max_bid_change_per_hour_percent": 30,
+    "no_negative_bids": true,
+    "respect_market_ceiling": true,
+    "description": "Operator must validate that all actions stay within safe operational bounds."
+  },
+  "transparency_policy": {
+    "require_reasoning_log": true,
+    "required_fields": [
+      "observed_metrics",
+      "calculated_utility",
+      "budget_penalty",
+      "shadow_price_lambda",
+      "final_optimization_score",
+      "decision_rationale"
+    ],
+    "purpose": "Ensure explainability and stakeholder trust."
+  }
+}
