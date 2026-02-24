@@ -84,8 +84,8 @@ class Analyst:
 
         analysis_output = json.loads(response.choices[0].message.content)
 
-        # Attach timestamp
-        analysis_output["timestamp"] = datetime.utcnow().isoformat()
+        # # Attach timestamp
+        # analysis_output["timestamp"] = datetime.utcnow().isoformat()
 
         self._log_analysis(analysis_output)
 
@@ -201,16 +201,16 @@ Guidelines:
 
 
 ## IGNORE THIS CODE BELOW ##
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-test_analyst = Analyst(
-    shared_knowledge_path=os.path.join(_SCRIPT_DIR, "knowledge", "shared_knowledge.json"),
-    policy_path=os.path.join(_SCRIPT_DIR, "knowledge", "policy_db.json"),
-    log_path=os.path.join(_SCRIPT_DIR, "logs", "analyst_log.jsonl"),
-)
+# test_analyst = Analyst(
+#     shared_knowledge_path=os.path.join(_SCRIPT_DIR, "knowledge", "shared_knowledge.json"),
+#     policy_path=os.path.join(_SCRIPT_DIR, "knowledge", "policy_db.json"),
+#     log_path=os.path.join(_SCRIPT_DIR, "logs", "analyst_log.jsonl"),
+# )
 
-test_analyst.analyze(
-    historical_df=pd.read_csv("data/ib_results.csv"),
-    tech_ping=None,
-)
+# test_analyst.analyze(
+#     historical_df=pd.read_csv("data/ib_results.csv"),
+#     tech_ping=None,
+# )
 ## IGNORE THIS CODE ABOVE ##    
