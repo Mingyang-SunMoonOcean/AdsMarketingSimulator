@@ -8,10 +8,14 @@
     "baseline_environment": {
       "target_cpa": 80.0,
       "baseline_cvr": 0.025,
-      "baseline_cpc": 2.0,
+      "baseline_cpc": 4.15,
       "market_ceiling_cpc": 20.0,
       "saturation_constant_k": 1.2,
-      "description": "Represents the healthy steady-state environment for Zurich Premium Auto."
+      "daily_budget_chf": 1000.0,
+      "initial_max_bid_chf": 5.0,
+      "competitive_bid_threshold_chf": 1.0,
+      "description": "Represents the healthy steady-state environment for Zurich Premium Auto. baseline_cpc is the realized average CPC in the simulation (~4.15 CHF). A max_bid below competitive_bid_threshold means the campaign wins almost no auctions — this is bid-silence, not a market failure.",
+      "budget_governance": "Daily budget changes are controlled only by Zupervisor using baseline-equivalent human triggers."
     },
   
     "market_patterns": [
@@ -76,11 +80,36 @@
     },
   
     "utility_intuition": {
-      "lead_value": 500.0,
+      "lead_value_alpha": 500.0,
       "holiday_bonus_value": 100.0,
-      "cpa_penalty_weight": 5.0,
-      "leakage_penalty_weight": 1.5,
-      "interpretation": "The system values profitable leads highly but punishes inefficient and toxic spending."
+      "cpa_penalty_weight_beta": 2.0,
+      "leakage_penalty_weight_gamma": 1.5,
+      "no_conversion_kappa": 0.20,
+      "interpretation": "Utility increases when leads are generated and decreases when leads are too expensive, conversion quality drops, or spend generates no leads. Pacing then rewards spending near the hourly budget target and penalizes overspending, with stronger urgency later in the day.",
+      "component_explanations": {
+        "lead_value_term": "Every lead contributes baseline business value, with a holiday bonus during confirmed surge windows.",
+        "cpa_penalty_term": "Penalty only applies when CPA is above target, and grows with lead volume.",
+        "leakage_penalty_term": "Strong penalty for spend that is both expensive (high CPA) and low quality (CVR below baseline).",
+        "no_conversion_term": "Overhead penalty when spend occurs but no leads are produced.",
+        "pacing_term": "Reward for on-target spend and stronger penalty for overspend, weighted by time-of-day urgency."
+      },
+      "pacing_score_detail": {
+        "formula": "PacingScore = lambda * min(spend, target_spend) - overspend_factor * lambda * max(spend - target_spend, 0)",
+        "target_spend_definition": "target_spend = (daily_budget / 24) * volatility",
+        "lambda_definition": "lambda = exp(hour_in_day / 24)",
+        "overspend_factor": 2.0,
+        "interpretation": "On-target spend earns pacing value; overspend is penalized at 2x intensity. Because lambda rises through the day, late-day pacing decisions have larger impact.",
+        "edge_cases": [
+          "Crash regime (volatility=0): target_spend=0, so any spend is overspend and hurts pacing.",
+          "Zero spend in normal regime: no overspend penalty, but no pacing reward either."
+        ]
+      },
+      "decision_guide_for_llms": [
+        "Increase or hold bids when lead value dominates penalties and pacing is healthy.",
+        "Reduce bids when CPA penalty and leakage terms dominate.",
+        "Treat spend with no leads as a warning sign even if other metrics look stable.",
+        "Balance efficiency early in day and budget deployment urgency later in day."
+      ]
     },
   
     "volatility_regimes": [
@@ -111,5 +140,35 @@
       "marketer_focus": "CPA stability and lead quality.",
       "executive_focus": "Total profit and budget utilization.",
       "system_requirement": "All decisions must produce reasoning logs for audit."
+    },
+
+    "event_calendar": {
+      "_description": "Scheduled and historically known external events that affect campaign performance. Agents should use this calendar for ANTICIPATORY strategy adjustments. The website crash is unpredictable and is communicated exclusively via real-time tech_ping alerts — it will NOT appear here in advance.",
+      "events": [
+        {
+          "event_id": "holiday_demand_period",
+          "type": "HOLIDAY",
+          "virtual_day_start": 20,
+          "virtual_day_end": 26,
+          "virtual_hour_start": 468,
+          "virtual_hour_end": 624,
+          "predictability": "KNOWN — anticipate 24h before virtual_day_start",
+          "expected_volatility_multiplier": 1.3,
+          "expected_effect": "Seasonal demand surge — buyers actively in market. CVR rises ~30% above baseline (v=1.3). CPC also rises with demand competition.",
+          "recommended_pre_action": "Increase daily budget 24h before Day 20 to capture extra volume (legacy_human pattern). Raise max_bid gradually to stay competitive on CPC.",
+          "recommended_action_during": "Scale bids aggressively but monitor CPA — higher CVR improves efficiency but rising CPC can erode margin. Balance volume vs CPA target.",
+          "caution": "Rising CPC may offset CVR gains if bids are raised too aggressively. See historical_incident: holiday_underbidding — not bidding enough during surge loses volume opportunity."
+        },
+        {
+          "event_id": "website_crash_event",
+          "type": "TECH_OUTAGE",
+          "predictability": "UNPREDICTABLE — detected exclusively via real-time tech_department ping (technology_ping field). Not pre-schedulable.",
+          "expected_volatility_multiplier": 0.0,
+          "expected_effect": "CVR collapses to near-zero. Any spend during outage is 100% toxic (zero conversion potential).",
+          "recommended_action": "Immediately pause bids (set max_bid to minimum) upon receiving a CRASH tech_ping. Resume only after RECOVERY ping is confirmed.",
+          "detection_lag_note": "Tech department detects crash with a ~1-hour lag. Expect toxic spend during undetected window. RECOVERY confirmation requires an additional ~30-minute verification window.",
+          "caution": "Do not resume normal bidding on RECOVERY ping alone without verifying CVR has stabilised in recent state_history data."
+        }
+      ]
     }
 }

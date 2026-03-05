@@ -1,19 +1,31 @@
 """Policy selection & Shadow Pricing (exp(t/24)) agent for OODA MAS."""
 
+from __future__ import annotations
+
 import json
 import math
 import os
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError
 import pandas as pd
+
+from core.state_manager import SimulationState
+
+# Retry config for transient OpenAI errors
+_MAX_ATTEMPTS = 5
+_BASE_DELAY_S = 5.0   # initial backoff; doubles each attempt, capped at 60 s
+_API_TIMEOUT_S = 90.0  # per-request timeout passed to the SDK
 
 BID_FLOOR = 0.50       # CHF – absolute minimum bid (mirrors rule_engine)
 BID_CEILING = 20.00    # CHF – absolute maximum bid (mirrors rule_engine)
 MAX_BID_CHANGE_PCT = 0.30   # ±30 % per hour (risk_appetite_policy)
-MAX_BUDGET_CHANGE_PCT = 0.20  # ±20 % per cycle (escalation_policy)
+INITIAL_MAX_BID = 5.00      # Baseline human reset bid
+LOW_UTIL_CHECK_INTERVAL_HOURS = 12
+LOOKBACK_STEPS_24H = 96
 
 
 class Strategist:
@@ -24,7 +36,7 @@ class Strategist:
     shared_knowledge_db, and uses an LLM (GPT) to select one of three
     operating modes:
 
-      NORMAL      – Standard shadow pricing; F = U - λ·P governs bid adjustments.
+      NORMAL      – Standard shadow pricing; F = U + Pacing Score governs bid adjustments.
       EMERGENCY   – Leakage / tech failure / severe CVR shock; retreat toward bid floor.
       OPPORTUNITY – Confirmed positive CVR surge; aggressive but bounded scaling.
 
@@ -44,11 +56,17 @@ class Strategist:
         self.client = OpenAI()
         self.model = model
 
+        self.policy_path = policy_path
         self.shared_knowledge = self._load_json(shared_knowledge_path)
         self.policy = self._load_json(policy_path)
         self.log_path = log_path
 
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+
+        # Build once — static policy/knowledge is embedded so OpenAI's prompt
+        # caching can reuse the identical prefix across all calls this run.
+        # Rebuilt in reload_policy() when the Zupervisor updates policy_db.json.
+        self._system_prompt = self._build_system_prompt()
 
     # --------------------------------------------------
     # JSON Loader
@@ -65,21 +83,23 @@ class Strategist:
     def decide(
         self,
         analysis_result: Dict[str, Any],
-        current_max_bid: float = 2.0,
-        current_daily_budget: float = 200.0,
+        state_history: List[SimulationState],
     ) -> Dict[str, Any]:
         """
         Produce a strategic bidding decision from the Analyst's signal.
 
+        Accepts raw state_history (List[SimulationState]) exactly as returned by
+        env.observe() — the same interface used by apply_proportional_rule() and
+        apply_human_intervener() in the industry baseline.
+
         Parameters
         ----------
         analysis_result : dict
-            Full output from Analyst.analyze() – contains analysis_result,
+            Full output from Analyst.analyze() — contains analysis_result,
             reasoning, confidence_score, summary_signal, and timestamp.
-        current_max_bid : float
-            The active max-bid (CPC cap) currently configured in the sandbox.
-        current_daily_budget : float
-            The active daily budget currently configured in the sandbox.
+        state_history : List[SimulationState]
+            Raw state history from env.observe(); latest entry used for current
+            max_bid and daily_budget.
 
         Returns
         -------
@@ -89,38 +109,73 @@ class Strategist:
             shadow_price_lambda, strategic_reasoning,
             constraint_notes, timestamp.
         """
+        # Extract current campaign state from the latest snapshot
+        latest = state_history[-1]
+        current_max_bid = latest.biz_inputs.max_bid
+        current_daily_budget = latest.biz_inputs.daily_budget
+        current_virtual_day = latest.market_outcome.current_day
+
         # Step 1 – Contextual Awareness: compute shadow price for this moment
         shadow_lambda = self._compute_shadow_price(analysis_result)
 
         payload = self._build_user_payload(
-            analysis_result, current_max_bid, current_daily_budget, shadow_lambda
+            analysis_result, current_max_bid, current_daily_budget,
+            shadow_lambda, current_virtual_day,
         )
 
         # Step 2 – LLM Reasoning: Glass-Box mode selection + bid calculation
-        system_prompt = self._build_system_prompt()
-        user_prompt = json.dumps(payload, indent=2)
+        # self._system_prompt carries static policy/knowledge (built once in __init__)
+        user_prompt = json.dumps(payload)
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            temperature=0.1,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-
-        raw_decision = json.loads(response.choices[0].message.content)
+        raw_decision = json.loads(self._call_llm([
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]))
 
         # Step 3 – Constraint Mapping: clamp to policy hard limits
         decision = self._apply_constraints(
             raw_decision, current_max_bid, current_daily_budget
+        )
+        decision = self._apply_low_utilization_reset(
+            decision, state_history, current_max_bid, current_daily_budget
         )
         decision["shadow_price_lambda"] = round(shadow_lambda, 4)
         decision["timestamp"] = datetime.utcnow().isoformat()
 
         self._log_decision(decision)
         return decision
+
+    # --------------------------------------------------
+    # LLM call with timeout + retry
+    # --------------------------------------------------
+
+    def _call_llm(self, messages: List[Dict[str, str]]) -> str:
+        """
+        Call OpenAI with a hard per-request timeout and exponential-backoff
+        retry on transient errors (rate limit, timeout, connection drop).
+
+        Raises the underlying exception if all attempts are exhausted.
+        """
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                    messages=messages,
+                    timeout=_API_TIMEOUT_S,
+                )
+                return response.choices[0].message.content
+            except (RateLimitError, APITimeoutError, APIConnectionError) as exc:
+                if attempt == _MAX_ATTEMPTS:
+                    raise
+                delay = min(_BASE_DELAY_S * (2 ** (attempt - 1)), 60.0)
+                print(
+                    f"[Strategist] {type(exc).__name__} on attempt {attempt}/{_MAX_ATTEMPTS}. "
+                    f"Retrying in {delay:.0f}s…",
+                    flush=True,
+                )
+                time.sleep(delay)
 
     # --------------------------------------------------
     # Shadow Price
@@ -157,19 +212,55 @@ Your role:
 - Receive the Analyst's structured market signal (summary_signal + reasoning).
 - Consult the Policy DB and Shared Knowledge provided in the user message.
 - Select ONE operating mode: NORMAL, EMERGENCY, or OPPORTUNITY.
-- Compute an exact bid_multiplier and a suggested_daily_budget.
+- Compute an exact bid_multiplier.
 - Produce transparent "Glass-Box" reasoning that exposes every inference step.
+
+When interpreting the optimization objective, prioritize semantic policy fields
+over symbol-only expressions:
+- optimization_objective.plain_language_summary
+- optimization_objective.objective_breakdown
+- optimization_objective.decision_intuition
+- utility_intuition.component_explanations
+- utility_intuition.decision_guide_for_llms
+
+Use formulas as validation checks, not as the only source of decision logic.
 
 ---
 
+RECOVERY MODE OVERRIDE (evaluate this FIRST, before any other mode selection):
+
+If current_max_bid_chf < 4.20 CHF AND summary_signal is NOT "TECH_FAILURE":
+  - The system is in a sub-competitive bid state (below the market CPC threshold of ~4.15 CHF).
+  - This arises after any bid-pause: emergency exits, daily budget depletion, or crash recovery.
+  - At bids below 4.20 CHF, reduced auction volume is EXPECTED — it is NOT a market failure,
+    leakage, or negative shock. Activity is proportionally lower simply because fewer auctions
+    are won. Below 0.80 CHF, almost no auctions are won; at 2–4 CHF, partial volume is won.
+  - OVERRIDE: select NORMAL mode regardless of any other negative signal.
+  - Set bid_multiplier = 1.30 (maximum allowed ramp) to accelerate bid recovery to competitive
+    levels. Do NOT apply the 0.85× EFFICIENCY_DRIFT correction multiplier — that correction
+    fights the recovery ramp and must be suppressed until bids exceed 4.20 CHF.
+  - The Taskmaster will apply a recovery floor (4.50 CHF) to jump-start competitiveness.
+  - Do NOT select EMERGENCY based on low activity when bids are in the sub-competitive zone.
+
+---
+
+BASELINE HUMAN LOW-UTILISATION BID RESET (12h routine):
+
+Mirror baseline/legacy_human section A behavior:
+- Every 12 virtual hours, review rolling 24h spend.
+- If rolling_24h_spend < 50% of current_daily_budget_chf:
+  - override suggested_max_bid = 5.00 CHF (baseline INITIAL_MAX_BID),
+  - regardless of prior multiplier recommendation.
+- This reset is a deterministic safety routine and may exceed normal ±30% ramp logic.
+
 MODE DEFINITIONS:
-  NORMAL      → Standard shadow pricing. The optimization function F = U - λ·P
+  NORMAL      → Standard shadow pricing. The optimization function F = U + Pacing Score
                 governs incremental adjustments (typical range ±5–15%).
-  EMERGENCY   → Capital protection mode. Triggered by leakage, tech failure, or
+  EMERGENCY   → Capital protection mode. Triggered by leakage, tech failure (e.g. website crash), or
                 severe CVR shock. Override all performance math; move bid toward
                 the policy floor (CHF 0.50). Stop toxic spend first.
-  OPPORTUNITY → Confirmed positive CVR surge. Aggressive but bounded scaling.
-                Bid multiplier may reach up to 1.30; never exceed policy ceiling.
+  OPPORTUNITY → Confirmed positive CVR surge (e.g., holiday period from event_calendar).
+                Aggressive but bounded scaling. Bid multiplier up to 1.30.
 
 MODE SELECTION MAP (primary trigger = summary_signal):
 You are to map the Analyst's SIGNAL and SEVERITY to a specific ACTION.
@@ -183,11 +274,18 @@ You are to map the Analyst's SIGNAL and SEVERITY to a specific ACTION.
    - If TECH_FAILURE: Mandatory 100% stop. Set Max Bid to 0.01 immediately.
    - If LEAKAGE_RISK or NEGATIVE_SHOCK:
         - Severity 1-4: Do not trigger Emergency. Treat as EFFICIENCY_DRIFT (Normal path + correction).
-        - Severity 5-7: Conservative Throttle. Cut Max Bid by 50% and reduce Daily Budget.
+        - Severity 5-7: Conservative Throttle. Cut Max Bid by 50%.
         - Severity 8-10: Immediate Kill-Switch. Set Max Bid to 0.01.
+   - IMPORTANT: Severity must be assessed from actual CPA vs target, NOT from the Analyst's
+     confidence_score. The confidence_score measures analytical certainty, not problem severity.
+     Use: severity = (actual_CPA - 80) / 8.0, capped at 10.
 
-3. OPPORTUNITY (Signal: POSITIVE_SURGE)
-   - Goal: Capitalize on volume.
+3. OPPORTUNITY (Signal: POSITIVE_SURGE) — e.g., confirmed holiday demand surge
+   - Goal: Capitalize on elevated conversion volume.
+   - Math: Max Bid = Base_Bid × 1.25–1.30 (maximum ramp).
+   - Holiday bonus: each lead is worth CHF 100 more (per optimization_objective).
+   - If current_max_bid < 2.00 CHF: Apply 1.30 multiplier; the Taskmaster recovery
+     floor will restore competitive bid levels — prioritize volume capture.
 ---
 
 GLASS-BOX REASONING REQUIREMENT:
@@ -197,11 +295,14 @@ The strategic_reasoning field MUST demonstrate all five reasoning layers:
                        the volatility_regime and efficiency_assessment from the Analyst.
 
   2. OPTIMIZATION MATH – Show your calculation of the optimization function direction:
-       - volume_score direction: are leads above or below the implied rate?
-       - cpa_penalty estimate: 5 × |observed_CPA - 80|  (use efficiency_assessment clues)
-       - leakage activation: is CPA > 80 AND CVR < 0.025?
+       - volume_score direction: are leads above or below the implied rate? (ALPHA=500 per lead)
+       - cpa_penalty estimate: BETA × max(0, actual_CPA − 80) × leads  (BETA=2, ONE-SIDED)
+         Note: zero leads → zero CPA penalty. Below-target CPA is NOT penalised.
+       - leakage activation: is CPA > 80 AND CVR < 0.025? (both required)
+       - no_conversion penalty: 0.20 × spend  (only when leads == 0 AND spend > 0)
        - shadow price λ interpretation: is it early (λ ≈ 1) or late (λ >> 1)?
-       - Conclude whether F benefits from bid increase, decrease, or hold.
+       - pacing score: λ × min(spend, target) − 2λ × max(spend − target, 0)
+       - Conclude whether F = U + Pacing Score benefits from bid increase, decrease, or hold.
 
   3. BID MULTIPLIER JUSTIFICATION – State the exact multiplier and explain why:
        (e.g., "Multiplier = 1.10 because pacing is on-track, CVR is stable,
@@ -220,7 +321,6 @@ HARD CONSTRAINTS (enforced programmatically after your output):
   - bid_multiplier:          min = BID_FLOOR / current_max_bid,
                              max = BID_CEILING / current_max_bid,
                              change capped at ±30 % of current bid.
-  - suggested_daily_budget:  within ±20 % of current_daily_budget.
 
 ---
 
@@ -231,9 +331,36 @@ Output STRICTLY valid JSON with these fields only:
   "selected_policies": ["<list of policy names invoked, e.g. cpa_efficiency_policy>"],
   "bid_multiplier": <float>,
   "suggested_max_bid": <float — current_max_bid × bid_multiplier, pre-constraint>,
-  "suggested_daily_budget": <float>,
+  "suggested_daily_budget": <float — set equal to current_daily_budget_chf>,
   "strategic_reasoning": "<multi-line glass-box explanation covering all 5 layers>"
 }
+
+---
+
+POLICY_CONTEXT:
+""" + json.dumps({
+            "optimization_objective": self.policy.get("optimization_objective"),
+            "cpa_efficiency_policy": self.policy.get("cpa_efficiency_policy"),
+            "budget_pacing_policy": self.policy.get("budget_pacing_policy"),
+            "volatility_response_policy": self.policy.get("volatility_response_policy"),
+            "risk_appetite_policy": self.policy.get("risk_appetite_policy"),
+            "escalation_policy": self.policy.get("escalation_policy"),
+            "noise_protection_policy": self.policy.get("noise_protection_policy"),
+            "execution_constraints": self.policy.get("execution_constraints"),
+            "transparency_policy": self.policy.get("transparency_policy"),
+        }) + """
+
+SHARED_KNOWLEDGE_CONTEXT:
+""" + json.dumps({
+            "baseline_environment": self.shared_knowledge.get("baseline_environment"),
+            "volatility_regimes": self.shared_knowledge.get("volatility_regimes"),
+            "market_patterns": self.shared_knowledge.get("market_patterns"),
+            "efficiency_relationships": self.shared_knowledge.get("efficiency_relationships"),
+            "utility_intuition": self.shared_knowledge.get("utility_intuition"),
+            "historical_incidents": self.shared_knowledge.get("historical_incidents"),
+            "noise_model_assumptions": self.shared_knowledge.get("noise_model_assumptions"),
+            "event_calendar": self.shared_knowledge.get("event_calendar"),
+        }) + """
 """
 
     def _build_user_payload(
@@ -242,8 +369,9 @@ Output STRICTLY valid JSON with these fields only:
         current_max_bid: float,
         current_daily_budget: float,
         shadow_lambda: float,
+        current_virtual_day: int,
     ) -> Dict[str, Any]:
-        """Package all context the LLM needs for fully-grounded reasoning."""
+        """Package only dynamic per-call data; static policy/knowledge is in the system prompt."""
         return {
             "analyst_signal": analysis_result,
             "current_campaign_state": {
@@ -254,26 +382,7 @@ Output STRICTLY valid JSON with these fields only:
                 "bid_floor_chf": BID_FLOOR,
                 "bid_ceiling_chf": BID_CEILING,
                 "max_bid_change_pct_per_hour": MAX_BID_CHANGE_PCT,
-            },
-            "policy_context": {
-                "optimization_objective": self.policy.get("optimization_objective"),
-                "cpa_efficiency_policy": self.policy.get("cpa_efficiency_policy"),
-                "budget_pacing_policy": self.policy.get("budget_pacing_policy"),
-                "volatility_response_policy": self.policy.get("volatility_response_policy"),
-                "risk_appetite_policy": self.policy.get("risk_appetite_policy"),
-                "escalation_policy": self.policy.get("escalation_policy"),
-                "noise_protection_policy": self.policy.get("noise_protection_policy"),
-                "execution_constraints": self.policy.get("execution_constraints"),
-                "transparency_policy": self.policy.get("transparency_policy"),
-            },
-            "shared_knowledge_context": {
-                "baseline_environment": self.shared_knowledge.get("baseline_environment"),
-                "volatility_regimes": self.shared_knowledge.get("volatility_regimes"),
-                "market_patterns": self.shared_knowledge.get("market_patterns"),
-                "efficiency_relationships": self.shared_knowledge.get("efficiency_relationships"),
-                "utility_intuition": self.shared_knowledge.get("utility_intuition"),
-                "historical_incidents": self.shared_knowledge.get("historical_incidents"),
-                "noise_model_assumptions": self.shared_knowledge.get("noise_model_assumptions"),
+                "current_virtual_day": current_virtual_day,
             },
         }
 
@@ -332,15 +441,13 @@ Output STRICTLY valid JSON with these fields only:
             )
 
         # ── Daily Budget ────────────────────────────────────────────────────
+        # Budget authority is owned by Zupervisor; Strategist emits only
+        # passthrough telemetry value for compatibility.
         raw_budget = float(raw.get("suggested_daily_budget", current_daily_budget))
-        budget_min = current_daily_budget * (1.0 - MAX_BUDGET_CHANGE_PCT)
-        budget_max = current_daily_budget * (1.0 + MAX_BUDGET_CHANGE_PCT)
-        budget = max(budget_min, min(raw_budget, budget_max))
-
-        if abs(budget - raw_budget) > 0.01:
+        budget = float(current_daily_budget)
+        if abs(raw_budget - current_daily_budget) > 0.01:
             notes.append(
-                f"suggested_daily_budget clamped CHF {raw_budget:.2f} → CHF {budget:.2f} "
-                f"(escalation_policy: max ±{int(MAX_BUDGET_CHANGE_PCT*100)}% deviation)"
+                "suggested_daily_budget ignored (budget authority delegated to Zupervisor)."
             )
 
         return {
@@ -352,6 +459,62 @@ Output STRICTLY valid JSON with these fields only:
             "strategic_reasoning": raw.get("strategic_reasoning", ""),
             "constraint_notes": notes if notes else ["No constraints violated."],
         }
+
+
+    def _apply_low_utilization_reset(
+        self,
+        decision: Dict[str, Any],
+        state_history: List[SimulationState],
+        current_max_bid: float,
+        current_daily_budget: float,
+    ) -> Dict[str, Any]:
+        """
+        Mirror baseline human 12h routine check:
+        if rolling 24h spend is below 50% of current budget, reset bid to 5.00 CHF.
+        """
+        if not state_history:
+            return decision
+
+        current_hour_abs = state_history[-1].market_outcome.current_hour
+        if current_hour_abs <= 0 or current_hour_abs % LOW_UTIL_CHECK_INTERVAL_HOURS != 0:
+            return decision
+
+        history_24h = state_history[-LOOKBACK_STEPS_24H:]
+        if not history_24h:
+            return decision
+
+        rolling_spend = sum(s.market_outcome.spend for s in history_24h)
+        if rolling_spend >= (current_daily_budget * 0.5):
+            return decision
+
+        decision["suggested_max_bid"] = round(INITIAL_MAX_BID, 2)
+        if current_max_bid > 0:
+            decision["bid_multiplier"] = round(INITIAL_MAX_BID / current_max_bid, 4)
+        notes = decision.get("constraint_notes", [])
+        if not isinstance(notes, list):
+            notes = [str(notes)]
+        notes.append(
+            "baseline_low_utilization_reset: rolling_24h_spend < 50% budget, bid reset to CHF 5.00."
+        )
+        decision["constraint_notes"] = notes
+
+        reasoning = decision.get("strategic_reasoning", "")
+        decision["strategic_reasoning"] = (
+            reasoning
+            + ("\n" if reasoning else "")
+            + "Baseline low-utilization reset applied: rolling 24h spend below 50% budget, bid reset to CHF 5.00."
+        )
+        return decision
+
+    # --------------------------------------------------
+    # Policy Reload
+    # --------------------------------------------------
+
+    def reload_policy(self) -> None:
+        """Re-read policy_db.json from disk to pick up Zupervisor edits."""
+        self.policy = self._load_json(self.policy_path)
+        # Rebuild system prompt so updated alpha/beta from Zupervisor take effect.
+        self._system_prompt = self._build_system_prompt()
 
     # --------------------------------------------------
     # Logging

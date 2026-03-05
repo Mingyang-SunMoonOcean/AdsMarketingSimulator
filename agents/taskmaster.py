@@ -1,67 +1,226 @@
-"""API interface to Sandbox for OODA MAS agents."""
+"""Deterministic execution / guardrail layer (ACT phase) for OODA MAS."""
 
-from typing import Optional
+from __future__ import annotations
 
-from fastapi import FastAPI
-from pydantic import BaseModel
+import json
+import os
+from datetime import datetime
+from typing import Any, Dict, List
 
-from core.sandbox_env import SandboxEnv
+from core.state_manager import SimulationState
+from core.volatility_scheduler import HOLIDAY_HOURS
 
-
-class ConfigInput(BaseModel):
-    daily_budget: Optional[float] = None
-    max_bid: Optional[float] = None
-
-
-def create_app(env: Optional[SandboxEnv] = None) -> FastAPI:
+class Taskmaster:
     """
-    FastAPI surface for operating agents.
+    Deterministic execution layer (The 'ACT' phase).
 
-    - POST /config: write daily budget / max bid into StateManager.
-    - POST /act: advance one 15‑minute step and return the latest outcome.
-    - GET  /observe: read the latest observable state (including last outcome).
-    """
-    app = FastAPI()
-    env = env or SandboxEnv()
+    Receives raw state_history (List[SimulationState]) plus the Analyst and
+    Strategist outputs directly — the same pattern as apply_proportional_rule()
+    and apply_human_intervener() in the industry baseline.
 
-    @app.get("/observe")
-    def observe():
-        """Agents call this to see current state and latest outcome."""
-        return env.observe()
-
-    @app.post("/config")
-    def config(data: ConfigInput):
-        """Agents call this to set daily budget and/or max bid."""
-        env.configure(daily_budget=data.daily_budget, max_bid=data.max_bid)
-        return {"status": "ok"}
-
-    @app.post("/act")
-    def act():
-        """Simulation script call this to advance time by one step."""
-        return env.act()
-
-    return app
-
-
-class Executor:
-    """
-    Executor agent: interfaces with the Sandbox via API or direct calls.
-
-    In simulation mode, holds a reference to SandboxEnv and calls
-    configure() / observe() directly. In API mode, makes HTTP requests.
+    Logic:
+    - Bids:    Updated every virtual hour based on Strategist + Analyst signals.
+    - Budgets: Not applied here; budget authority is delegated to Zupervisor only.
+    - Safety:  Enforces absolute bid floors, market ceilings, and kill-switch.
+    - Recovery: After exiting emergency mode, applies a jump-start floor (2.00 CHF)
+               so bids immediately re-enter competitive territory.
     """
 
-    def __init__(self, env: SandboxEnv):
-        self.env = env
+    # Recovery floor applied after any bid-pause (emergency or budget depletion).
+    # Set at 4.50 CHF — above the competitive CPC threshold (~4.15 CHF) — so the
+    # campaign re-enters competitive auctions immediately rather than crawling up
+    # from 0.50 CHF over 32+ virtual hours.
+    RECOVERY_BID_FLOOR: float = 4.50
+    POST_HOLIDAY_STABILIZATION_HOURS: int = 24
+    POST_HOLIDAY_MAX_UP_RAMP: float = 1.15
 
-    def observe(self):
-        """Observe current state from the sandbox."""
-        return self.env.observe()
+    def __init__(
+        self,
+        policy_path: str = "agents/knowledge/policy_db.json",
+        shared_kb_path: str = "agents/knowledge/shared_knowledge.json",
+        analyst_log: str = "agents/logs/analyst_log.jsonl",
+        strategist_log: str = "agents/logs/strategist_log.jsonl",
+        log_path: str = "agents/logs/taskmaster_log.jsonl"
+    ):
+        self.policy_path = policy_path
+        self.shared_kb_path = shared_kb_path
+        self.analyst_log = analyst_log
+        self.strategist_log = strategist_log
+        self.log_path = log_path
 
-    def configure(self, daily_budget: Optional[float] = None, max_bid: Optional[float] = None):
-        """Write configuration to the sandbox."""
-        self.env.configure(daily_budget=daily_budget, max_bid=max_bid)
+        self.current_state = {
+            "max_bid": 2.0,
+            "daily_budget": 1000.0,
+            "cycle_counter": 0,
+        }
+        # Emergency tracking: enables recovery floor after any bid-pause.
+        self._was_emergency: bool = False
+        # Countdown of OODA cycles during which the recovery floor stays active.
+        # Set to 4 whenever a bid-pause ends (emergency OR budget depletion).
+        # This ensures at least 4 cycles (8–16 virtual hours) of competitive floor
+        # even if the first recovery cycle itself depletes the budget.
+        self._recovery_cycles_remaining: int = 0
 
-    def act(self):
-        """Advance simulation by one step (typically called by simulation driver)."""
-        return self.env.act()
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+
+    def _load_json(self, path: str) -> Dict:
+        with open(path, "r") as f:
+            return json.load(f)
+
+    # --------------------------------------------------
+    # Main Entry Point
+    # --------------------------------------------------
+
+    def execute_cycle(
+        self,
+        state_history: List[SimulationState],
+        analysis_result: Dict[str, Any],
+        decision: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Enforce bid guardrails and return final executable bid.
+
+        Returns a report dict with:
+          bid_execution.actual        → pass to env.configure(max_bid=...)
+          budget_execution.*          → telemetry only; no budget is applied here.
+        """
+        kb = self._load_json(self.shared_kb_path)
+        latest = state_history[-1]
+
+        self.current_state["cycle_counter"] += 1
+        self.current_state["daily_budget"] = latest.biz_inputs.daily_budget
+
+        current_budget = latest.biz_inputs.daily_budget
+        old_bid = self.current_state["max_bid"]
+
+        # ── 1. Extract Strategist's proposed bid and mode ───────────────────
+        proposed_bid = decision.get("suggested_max_bid", self.current_state["max_bid"])
+        mode         = decision.get("selected_mode", "NORMAL")
+        safety_notes: List[str] = []
+
+        # ── 2. GUARDRAIL: Tech Kill-Switch ──────────────────────────────────
+        # Use the Analyst's structured summary_signal (not fragile string matching).
+        # TECH_FAILURE is only set when an authoritative tech_ping CRASH is active,
+        # or when bids are competitive AND CVR has collapsed — never for bid-silence.
+        is_tech_failure = analysis_result.get("summary_signal") == "TECH_FAILURE"
+        if is_tech_failure and mode != "EMERGENCY":
+            proposed_bid = 0.01
+            mode = "EMERGENCY_OVERRIDE"
+            safety_notes.append(
+                "CRITICAL: Analyst confirmed TECH_FAILURE signal. Overriding to Kill-Switch."
+            )
+
+        # ── 3. GUARDRAIL: Absolute Policy Bounds ────────────────────────────
+        ceiling = kb.get("baseline_environment", {}).get("market_ceiling_cpc", 20.0)
+        floor   = 0.50  # policy floor for Zurich Audi
+
+        # Recovery floor: active on every cycle while _recovery_cycles_remaining > 0
+        # OR on the first non-emergency cycle (_was_emergency still True).
+        # Ensures at least 4 OODA cycles at competitive bid after any bid-pause,
+        # preventing the sub-competitive crawl from 0.50 CHF.
+        if mode not in ["EMERGENCY", "EMERGENCY_OVERRIDE"] and (
+            self._was_emergency or self._recovery_cycles_remaining > 0
+        ):
+            floor = max(floor, self.RECOVERY_BID_FLOOR)
+            safety_notes.append(
+                f"Recovery floor active (cycles remaining: {self._recovery_cycles_remaining}): "
+                f"bid floor raised to CHF {floor:.2f}."
+            )
+
+        final_bid = max(floor, min(proposed_bid, ceiling))
+
+        # Confirmed emergencies bypass the floor
+        if mode in ["EMERGENCY", "EMERGENCY_OVERRIDE"]:
+            final_bid = 0.01
+
+        # ── 4. Post-holiday stabilization guard ──────────────────────────────
+        # The first 24h after holiday are volatile; cap upward ramps to avoid
+        # overspend spikes and repeated stop/start behavior.
+        current_hour_abs = int(latest.market_outcome.current_hour)
+        holiday_end_hour = HOLIDAY_HOURS[1]
+        in_post_holiday_stabilization = (
+            holiday_end_hour < current_hour_abs <= holiday_end_hour + self.POST_HOLIDAY_STABILIZATION_HOURS
+        )
+        if in_post_holiday_stabilization and mode not in ["EMERGENCY", "EMERGENCY_OVERRIDE"]:
+            max_allowed = old_bid * self.POST_HOLIDAY_MAX_UP_RAMP
+            if final_bid > max_allowed:
+                final_bid = max_allowed
+                safety_notes.append(
+                    "Post-holiday stabilization: capped upward bid ramp to +15% for smoother transition."
+                )
+
+        # ── 5. Budget safety: throttle before hard stop ──────────────────────
+        # Replace unconditional pause with a two-tier throttle unless we are in
+        # true emergency mode. This preserves auction participation while still
+        # preventing runaway spend near budget depletion.
+        is_budget_depleted = latest.derived_variables.budget_status == "budget_depleted"
+        if is_budget_depleted and mode not in ["EMERGENCY", "EMERGENCY_OVERRIDE"]:
+            day_spend = float(latest.derived_variables.current_day_spend or 0.0)
+            budget_ratio = (day_spend / current_budget) if current_budget > 0 else 0.0
+            if budget_ratio >= 1.05:
+                final_bid = min(final_bid, max(0.50, old_bid * 0.20))
+                safety_notes.append(
+                    "Daily budget critically depleted — applying hard throttle (20% of prior bid, floored at CHF 0.50)."
+                )
+            else:
+                final_bid = min(final_bid, max(1.50, old_bid * 0.40))
+                safety_notes.append(
+                    "Daily budget near depleted — applying soft throttle (40% of prior bid, floored at CHF 1.50)."
+                )
+        elif is_budget_depleted:
+            final_bid = 0.01
+            safety_notes.append("Daily budget depleted during emergency — pausing bids until next calendar day.")
+
+        # ── 6. Update bid state ─────────────────────────────────────────────
+        self.current_state["max_bid"] = round(final_bid, 2)
+
+        # Track whether a bid-pause just occurred (emergency or emergency-time
+        # budget depletion). Non-emergency depletion now uses throttling.
+        budget_depleted_pause = (
+            is_budget_depleted
+            and final_bid == 0.01
+        )
+        if mode in ["EMERGENCY", "EMERGENCY_OVERRIDE"] or budget_depleted_pause:
+            self._was_emergency = True
+            self._recovery_cycles_remaining = 4   # floor persists for 4 OODA cycles
+        else:
+            self._was_emergency = False
+            if self._recovery_cycles_remaining > 0:
+                self._recovery_cycles_remaining -= 1
+
+        # ── 7. Budget telemetry only ────────────────────────────────────────
+        # Budget authority lives in Zupervisor. Taskmaster records budget-related
+        # context for auditability but does not apply budget changes.
+        proposed_budget = float(decision.get("suggested_daily_budget", current_budget))
+        final_budget = None
+        budget_reason = "zupervisor_only_budget_authority"
+
+        # ── 8. Audit log ────────────────────────────────────────────────────
+        report = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "cycle": self.current_state["cycle_counter"],
+            "virtual_day":  latest.market_outcome.current_day,
+            "virtual_hour": latest.market_outcome.current_hour,
+            "mode_executed": mode,
+            "analyst_signal": analysis_result.get("summary_signal", "UNKNOWN"),
+            "bid_execution": {
+                "proposed": round(proposed_bid, 2),
+                "actual":   self.current_state["max_bid"],
+                "delta":    round(self.current_state["max_bid"] - old_bid, 2),
+            },
+            "budget_execution": {
+                "final_budget":         final_budget,
+                "proposed":             round(proposed_budget, 2),
+                "current":              round(current_budget, 2),
+                "hours_since_last_change": None,
+                "reason":               budget_reason,
+            },
+            "safety_overrides": safety_notes if safety_notes else [],
+        }
+
+        self._log_execution(report)
+        return report
+
+    def _log_execution(self, report: Dict[str, Any]) -> None:
+        with open(self.log_path, "a") as f:
+            f.write(json.dumps(report) + "\n")
