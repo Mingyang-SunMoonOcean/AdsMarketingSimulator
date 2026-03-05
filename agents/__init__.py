@@ -1,8 +1,8 @@
-"""OODA MAS Components: Analyst, Strategist, Executor, Human Supervisor."""
+"""OODA MAS Components: Analyst, Strategist, Taskmaster, Zupervisor."""
 
 from .analyst import Analyst
 from .strategist import Strategist
-from .executor import Executor
-from .human_supervisor import HumanSupervisor
+from .taskmaster import Taskmaster
+from .zupervisor import Zupervisor
 
-__all__ = ["Analyst", "Strategist", "Executor", "HumanSupervisor"]
+__all__ = ["Analyst", "Strategist", "Taskmaster", "Zupervisor"]

@@ -1,55 +1,103 @@
 {
   "_meta": {
     "name": "OODA MAS Thesis Policy Database",
-    "version": "1.0",
-    "purpose": "This Policy Database defines the behavioral constraints and optimization objective of the Multi-Agent System. It ensures that the Strategist maximizes the total optimization function F = U - λ·P while respecting efficiency, pacing, volatility response, and risk boundaries."
+    "version": "1.1",
+    "purpose": "Defines behavioral constraints and optimization objective of the Multi-Agent System. Strategist uses this for bid reasoning; budget changes are governed by Zupervisor-only baseline trigger rules. Numeric values align with logic/optimization.py."
   },
   "optimization_objective": {
-    "description": "The system must maximize F = U - λ·P.",
-    "utility_definition": "U = volume_score - cpa_penalty - leakage_penalty",
+    "description": "Primary objective: maximize business value from leads while keeping acquisition efficient and budget pacing healthy.",
+    "plain_language_summary": "The objective rewards lead generation, penalizes expensive conversion, penalizes wasteful spend when conversion quality deteriorates, penalizes spend with zero leads, and rewards spending close to the time-adjusted hourly target.",
+    "utility_definition": "Utility is lead value minus inefficiency and waste penalties.",
+    "objective_breakdown": {
+      "final_score": "F = Utility + PacingScore",
+      "utility_component": "Net business value from outcomes (lead value - CPA penalty - leakage penalty - no-conversion penalty).",
+      "pacing_component": "Spending discipline term: reward on-target spend, stronger penalty for overspend, weighted by time-of-day urgency."
+    },
+    "decision_intuition": [
+      "More leads at acceptable CPA should increase bids or maintain them.",
+      "High CPA above target should reduce score and push toward tighter bidding.",
+      "When CPA is high and CVR is weak, spend is likely low quality and should be penalized strongly.",
+      "Spending with no leads is treated as avoidable overhead.",
+      "Late-day under-delivery is more costly than early-day under-delivery due to higher pacing urgency."
+    ],
     "volume_score": {
       "alpha_value_per_lead": 500,
+      "alpha_min": 400,
+      "alpha_max": 700,
       "holiday_bonus_per_lead": 100,
-      "explanation": "Each lead is worth CHF 500. During holiday periods, each lead receives an additional CHF 100 bonus."
+      "explanation": "Each lead contributes business value. Baseline value is CHF 500 per lead, with an extra CHF 100 bonus during confirmed holiday windows to reflect higher strategic opportunity."
     },
     "cpa_penalty": {
-      "beta_penalty_weight": 5,
+      "beta_penalty_weight": 2,
+      "beta_min": 2,
+      "beta_max": 2,
       "target_cpa": 80,
-      "formula": "5 × |actual_CPA - 80|",
-      "explanation": "Deviation from target CPA reduces utility. Larger inefficiencies are penalized proportionally."
+      "formula": "BETA \u00d7 max(0, actual_CPA \u2212 80) \u00d7 leads",
+      "explanation": "Only above-target CPA is penalized. The penalty scales with lead volume, so costly acquisition at scale is penalized more than small fluctuations."
     },
     "leakage_penalty": {
       "gamma_multiplier": 1.5,
       "base_cvr": 0.025,
-      "activation_condition": "Only applies when actual_CPA > 80",
-      "logic": "If conversion rate drops below baseline and CPA exceeds target, spending is considered toxic and penalized proportionally to spend and performance gap."
+      "activation_condition": "CPA > 80 AND CVR < 0.025 (both conditions required)",
+      "formula": "GAMMA \u00d7 spend \u00d7 max(0, 1 \u2212 actual_CVR / base_CVR)",
+      "logic": "Leakage penalty activates only when both efficiency and quality are poor: CPA is above target and CVR is below baseline. This captures spend that is expensive and low quality."
     },
-    "budget_penalty": {
-      "definition": "P = |actual_hourly_spend - expected_hourly_budget|",
-      "expected_hourly_budget": "daily_budget / 24",
-      "shadow_price_lambda": "λ = exp(current_hour / 24)",
-      "explanation": "Budget deviation is penalized increasingly throughout the day. Early hours prioritize performance; late hours prioritize full budget utilization."
+    "no_conversion_penalty": {
+      "kappa": 0.2,
+      "formula": "KAPPA \u00d7 spend  (only when leads == 0 AND spend > 0)",
+      "explanation": "If spend occurs with zero leads, 20% of spend is penalized as overhead. This discourages silent budget burn even when other penalties do not activate."
+    },
+    "pacing_score": {
+      "formula": "\u03bb \u00d7 min(spend, target) \u2212 OVERSPEND_FACTOR \u00d7 \u03bb \u00d7 max(spend \u2212 target, 0)",
+      "lambda": "exp(current_hour_in_day / 24) \u2014 shadow price of budget utilisation",
+      "target_spend": "daily_budget / 24 \u00d7 volatility  (zero during crash)",
+      "overspend_factor": 2.0,
+      "explanation": "Pacing rewards spending near the volatility-adjusted hourly target and penalizes overspending more heavily than it rewards spend. Time-of-day urgency rises later in the day, so late pacing misses matter more.",
+      "detailed_formula_definition": {
+        "reward_term": "lambda * min(actual_spend, target_spend)",
+        "overspend_term": "overspend_factor * lambda * max(actual_spend - target_spend, 0)",
+        "net_pacing_score": "reward_term - overspend_term",
+        "variable_meanings": {
+          "actual_spend": "Total spend observed in the decision window.",
+          "target_spend": "Expected spend for that window based on daily budget and volatility regime.",
+          "lambda": "Time-of-day urgency weight. Low early day, higher late day.",
+          "overspend_factor": "Asymmetry multiplier (2.0) so overspending is punished more strongly."
+        }
+      },
+      "sign_intuition": [
+        "If spend is on or below target, pacing score is non-negative and increases with lambda.",
+        "If spend exceeds target, overspend penalty grows quickly because it is multiplied by overspend_factor and lambda.",
+        "During crash (volatility=0), target_spend becomes zero, so any positive spend is treated as overspend."
+      ],
+      "worked_examples": [
+        "Normal hour: spend near target => positive pacing contribution.",
+        "Late-day underspend: lower immediate penalty than overspend, but missed reward is larger because lambda is high.",
+        "Crash hour: spend=0 => pacing ~0; spend>0 => negative pacing."
+      ]
     }
   },
   "cpa_efficiency_policy": {
     "target_cpa": 80,
-    "acceptable_deviation_band": 10,
+    "acceptable_deviation_band": 16,
     "hard_efficiency_threshold": 120,
     "policy_logic": [
-      "If CPA slightly above target → reduce bids gradually.",
-      "If CPA significantly above target → reduce bids aggressively.",
-      "If CPA remains above hard threshold for multiple hours → escalate."
+      "If CPA slightly above target \u2192 reduce bids gradually.",
+      "If CPA significantly above target \u2192 reduce bids aggressively.",
+      "If CPA remains above hard threshold for multiple hours \u2192 escalate."
     ]
   },
   "budget_pacing_policy": {
     "objective": "Spend the full daily budget without large hourly deviations.",
+    "budget_governance": "Zupervisor only. Strategist and Taskmaster do not execute budget changes.",
     "overspend_tolerance_percent": 5,
     "underspend_tolerance_percent": 10,
     "late_day_priority_increase": true,
+    "review_cadence_hours": 24,
     "policy_logic": [
-      "Early in the day → prioritize CPA efficiency.",
-      "Late in the day → prioritize spending remaining budget.",
-      "Avoid large underspending unless CPA protection requires it."
+      "Early in the day \u2192 prioritise CPA efficiency (\u03bb \u2248 1).",
+      "Late in the day \u2192 prioritise spending remaining budget (\u03bb >> 1).",
+      "Avoid large underspending unless CPA protection requires it.",
+      "Budget changes are applied only by Zupervisor through baseline-equivalent trigger checks."
     ]
   },
   "volatility_response_policy": {
@@ -58,54 +106,59 @@
     "severe_drop_threshold_percent": 70,
     "positive_surge_multiplier": 1.3,
     "policy_logic": [
-      "If CVR drops moderately → reduce bids.",
-      "If CVR drops severely → pause campaign to prevent leakage.",
-      "If CVR surges significantly → increase bids cautiously.",
-      "Confirm volatility before major actions."
+      "If CVR drops moderately \u2192 reduce bids.",
+      "If CVR drops severely \u2192 pause campaign to prevent leakage.",
+      "If CVR surges significantly \u2192 increase bids cautiously (OPPORTUNITY mode).",
+      "Confirm volatility over multiple hours before major actions.",
+      "Market silence caused by sub-market bids (max_bid \u2264 0.80 CHF) is NOT a CVR drop."
     ]
   },
   "risk_appetite_policy": {
     "mode": "balanced",
     "max_bid_change_per_hour_percent": 30,
     "max_consecutive_aggressive_moves": 3,
+    "recovery_bid_floor_chf": 2.0,
     "policy_logic": [
       "Avoid extreme bid swings.",
       "Prefer gradual adjustments.",
-      "Protect capital before chasing volume."
+      "Protect capital before chasing volume.",
+      "After emergency bid-pause: Taskmaster applies a CHF 2.00 recovery floor on the first non-emergency cycle to restore market competitiveness quickly."
     ]
   },
   "escalation_policy": {
     "conditions_for_escalation": [
       "CPA above 120 for more than 3 hours.",
       "Campaign paused for more than 6 hours.",
-      "Budget deviation exceeds 20%."
+      "Budget deviation exceeds 20 %."
     ],
     "action": "Notify human supervisor.",
-    "purpose": "Prevent autonomous drift and maintain trust."
+    "purpose": "Prevent autonomous drift and maintain stakeholder trust."
   },
   "noise_protection_policy": {
     "minimum_confirmation_hours": 1,
     "policy_logic": [
       "Do not react to single-hour anomalies.",
-      "Require persistence before large bid or pause decisions."
+      "Require persistence before large bid or pause decisions.",
+      "Near-zero activity when max_bid \u2264 0.80 CHF is bid-induced silence, not a structural market failure."
     ]
   },
   "execution_constraints": {
+    "bid_floor_chf": 0.5,
+    "bid_ceiling_chf": 20.0,
     "max_bid_change_per_hour_percent": 30,
     "no_negative_bids": true,
     "respect_market_ceiling": true,
-    "description": "Operator must validate that all actions stay within safe operational bounds."
+    "description": "All actions must stay within safe operational bounds. The Taskmaster enforces these programmatically after every LLM decision."
   },
   "transparency_policy": {
     "require_reasoning_log": true,
     "required_fields": [
-      "observed_metrics",
-      "calculated_utility",
-      "budget_penalty",
-      "shadow_price_lambda",
-      "final_optimization_score",
-      "decision_rationale"
+      "signal_mapping",
+      "optimization_math",
+      "bid_multiplier_justification",
+      "policy_grounding",
+      "uncertainty_acknowledgement"
     ],
-    "purpose": "Ensure explainability and stakeholder trust."
+    "purpose": "Ensure explainability and stakeholder trust. All five glass-box reasoning layers are mandatory."
   }
 }

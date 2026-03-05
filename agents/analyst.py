@@ -1,23 +1,34 @@
 """Observation / Anomaly Detection agent for OODA MAS."""
 
-from typing import List, Optional
+from __future__ import annotations
 
 import json
 import os
-from dotenv import load_dotenv
+import time
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from openai import OpenAI
+from dotenv import load_dotenv
+from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError
+
+from core.state_manager import SimulationState
+
+# Retry config for transient OpenAI errors
+_MAX_ATTEMPTS = 5
+_BASE_DELAY_S = 5.0   # initial backoff; doubles each attempt, capped at 60 s
+_API_TIMEOUT_S = 90.0  # per-request timeout passed to the SDK
 
 
 class Analyst:
     """
     Analyst agent: Observation and Anomaly Detection.
 
+    Receives the raw state_history list (same format SandboxEnv.observe() returns),
+    mirrors the interface of baseline/rule_engine.py and baseline/legacy_human.py.
+
     This agent:
-    - Interprets recent performance context
+    - Interprets recent performance context from state_history
     - Uses shared knowledge + policy grounding
     - Produces structured analytical output
     - Does NOT make decisions
@@ -27,11 +38,10 @@ class Analyst:
         self,
         shared_knowledge_path: str,
         policy_path: str,
-        log_path: str = "logs/analyst_log.jsonl",
+        log_path: str = "agents/logs/analyst_log.jsonl",
         model: str = "gpt-4.1-nano"
     ):
         load_dotenv()
-        print(f"Key loaded: {os.getenv('OPENAI_API_KEY')[:5]}...")
         self.client = OpenAI()
         self.model = model
 
@@ -41,9 +51,40 @@ class Analyst:
 
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
 
+        # Build once — static knowledge/policy is embedded so OpenAI's prompt
+        # caching can reuse the identical prefix across all calls this run.
+        self._system_prompt = self._build_system_prompt()
+
     def _load_json(self, path: str) -> Dict[str, Any]:
         with open(path, "r") as f:
             return json.load(f)
+
+    # --------------------------------------------------
+    # State History → DataFrame conversion
+    # (mirrors what rule_engine.py does with state_history)
+    # --------------------------------------------------
+
+    @staticmethod
+    def _to_dataframe(state_history: List[SimulationState]) -> pd.DataFrame:
+        """Convert raw state_history (from env.observe()) to a pandas DataFrame."""
+        return pd.DataFrame([
+            {
+                "current_day": s.market_outcome.current_day,
+                "current_hour": s.market_outcome.current_hour,
+                "current_minute": s.market_outcome.current_minute,
+                "clicks": s.market_outcome.clicks,
+                "leads": s.market_outcome.leads,
+                "spend": s.market_outcome.spend,
+                "cpa": s.market_outcome.cpa,
+                "realized_cpc": s.market_outcome.realized_cpc,
+                "daily_budget": s.biz_inputs.daily_budget,
+                "max_bid": s.biz_inputs.max_bid,
+                "volatility": s.external_events_inputs.volatility,
+                "budget_status": s.derived_variables.budget_status,
+                "current_day_spend": s.derived_variables.current_day_spend,
+            }
+            for s in state_history
+        ])
 
     # --------------------------------------------------
     # Main Entry Point
@@ -51,45 +92,73 @@ class Analyst:
 
     def analyze(
         self,
-        historical_df: pd.DataFrame,
+        state_history: List[SimulationState],
         tech_ping: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """
+        Observe and interpret the simulation state.
 
-        # Recent context window (last 1 hour = 4 steps)
-        window_df = historical_df.tail(4)
-        loopback_df = historical_df.tail(16)  # 4 hours context
-        rolling_24h_lookback_df = historical_df.tail(96)  # 24 hours context
+        Accepts raw state_history (List[SimulationState]) exactly as returned by
+        env.observe() — the same interface used by apply_proportional_rule() and
+        apply_human_intervener() in the industry baseline.
+        """
+        historical_df = self._to_dataframe(state_history)
 
+        # Recent context windows
+        window_df = historical_df.tail(4)     # last 1 hour  (4 steps)
+        loopback_df = historical_df.tail(16)  # last 4 hours (16 steps)
+        rolling_24h_lookback_df = historical_df.tail(96)  # last 24 hours (96 steps)
+
+        # Only dynamic per-call data goes in the user message; static knowledge/policy
+        # lives in self._system_prompt (built once in __init__) so it can be cached.
         payload = {
             "recent_window_data": window_df.to_dict(orient="records"),
             "loopback_context": loopback_df.to_dict(orient="records"),
             "rolling_24h_lookback_context": rolling_24h_lookback_df.to_dict(orient="records"),
             "technology_ping": tech_ping,
-            "shared_knowledge": self._extract_relevant_knowledge(),
-            "policy_context": self._extract_relevant_policy()
         }
 
-        system_prompt = self._build_system_prompt()
-        user_prompt = json.dumps(payload, indent=2)
+        user_prompt = json.dumps(payload)
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-        )
-
-        analysis_output = json.loads(response.choices[0].message.content)
-
-        # # Attach timestamp
-        # analysis_output["timestamp"] = datetime.utcnow().isoformat()
-
+        raw = self._call_llm([
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_prompt},
+        ])
+        analysis_output = json.loads(raw)
         self._log_analysis(analysis_output)
-
         return analysis_output
+
+    # --------------------------------------------------
+    # LLM call with timeout + retry
+    # --------------------------------------------------
+
+    def _call_llm(self, messages: List[Dict[str, str]]) -> str:
+        """
+        Call OpenAI with a hard per-request timeout and exponential-backoff
+        retry on transient errors (rate limit, timeout, connection drop).
+
+        Raises the underlying exception if all attempts are exhausted.
+        """
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                    messages=messages,
+                    timeout=_API_TIMEOUT_S,
+                )
+                return response.choices[0].message.content
+            except (RateLimitError, APITimeoutError, APIConnectionError) as exc:
+                if attempt == _MAX_ATTEMPTS:
+                    raise
+                delay = min(_BASE_DELAY_S * (2 ** (attempt - 1)), 60.0)
+                print(
+                    f"[Analyst] {type(exc).__name__} on attempt {attempt}/{_MAX_ATTEMPTS}. "
+                    f"Retrying in {delay:.0f}s…",
+                    flush=True,
+                )
+                time.sleep(delay)
 
     # --------------------------------------------------
     # Prompt Construction
@@ -97,30 +166,85 @@ class Analyst:
 
     def _build_system_prompt(self) -> str:
         return """
-You are the Analyst Agent in a Multi-Agent OODA system.
+You are the Analyst Agent in a Multi-Agent OODA system for a Zurich Audi dealership campaign.
 
 Your role:
-- Observe performance metrics.
-- Contextualize them using shared knowledge and policy.
+- Observe performance metrics from state_history.
+- Contextualize them using shared knowledge, event_calendar, and policy.
 - Detect patterns, anomalies, and regimes.
 - Assess efficiency, leakage risk, pacing status, and technology impact.
-- DO NOT suggest actions.
-- DO NOT make decisions.
-- Only analyze and interpret.
+- DO NOT suggest actions. DO NOT make decisions. Only analyze and interpret.
+
+---
+
+CRITICAL — DISTINGUISHING SELF-INFLICTED BID SILENCE FROM REAL MARKET FAILURES:
+
+Before classifying near-zero activity (zero leads, zero spend, near-zero CVR) as
+TECH_FAILURE, LEAKAGE_RISK, or NEGATIVE_SHOCK, you MUST inspect the max_bid field
+in recent_window_data:
+
+  LOW-BID SILENCE RULE:
+  If ALL max_bid values in recent_window_data are < 4.20 CHF:
+    - The reduced or near-zero activity is caused by our own sub-market bid, NOT a website
+      failure, leakage, or negative shock.
+    - The market competitive CPC threshold is ~4.15 CHF. Bids below this threshold win
+      proportionally fewer auctions:
+        • bid < 0.80 CHF  → almost zero auction wins ("bid-floor silence")
+        • bid 0.80–4.15 CHF → partial auction volume, proportionally reduced activity
+        • bid ≥ 4.15 CHF  → full competitive participation
+    - This sub-competitive state arises during bid recovery after any pause (emergency,
+      budget depletion, or crash recovery). It is NOT a structural market failure.
+    - Set technology_impact: "No technical outages detected. Market activity is reduced
+      by sub-competitive max_bid (< 4.20 CHF vs competitive threshold ~4.15 CHF).
+      Bid recovery is in progress — this is NOT a market or tech failure."
+    - Set summary_signal = "EFFICIENCY_DRIFT" (system is recovering; normal operation
+      expected once bids reach competitive levels).
+    - Do NOT set summary_signal = "TECH_FAILURE", "LEAKAGE_RISK", or "NEGATIVE_SHOCK"
+      solely because activity is low when bids are sub-competitive.
+
+  TECH_FAILURE may only be set when:
+    (a) technology_ping.event == "CRASH" is present (authoritative), OR
+    (b) technology_ping is null AND max_bid ≥ 4.20 CHF in recent_window_data
+        AND the CVR (leads ÷ clicks where clicks > 0) is < 0.005.
+    Sub-competitive bids produce reduced activity identical to market downturns or outages
+    in the raw metrics — you MUST check bid level before inferring any external failure.
+
+---
+
+HOW TO USE EXTERNAL SIGNALS:
+
+1. TECHNOLOGY PING (technology_ping field in this message):
+   - This is a real-time alert from the tech department. Treat it as AUTHORITATIVE.
+   - If technology_ping.event == "CRASH": The website is confirmed down. CVR is near-zero.
+     Set technology_impact to clearly state an outage is active and toxic spend is occurring.
+     Set summary_signal = "TECH_FAILURE" regardless of what the market data shows.
+   - If technology_ping.event == "RECOVERY": The website has been confirmed restored.
+     Verify CVR in recent state_history before concluding the market has normalised.
+     Set technology_impact to reflect recovery is confirmed but CVR needs verification.
+   - If technology_ping is null: No tech alert active. Use market data to infer tech status.
+     State "No technical outages detected" in technology_impact if data looks normal.
+
+2. EVENT CALENDAR (event_calendar in shared_knowledge):
+   - Contains KNOWN future events the system can anticipate (e.g., holiday period).
+   - Cross-reference the current_day from state_history with event virtual_day_start/end.
+   - If current_day is within 1 day BEFORE an event: flag it in market_context_summary
+     as an anticipatory warning ("Holiday period begins tomorrow — pre-emptive adjustment warranted").
+   - If current_day is WITHIN an event window: reference expected_effect in your assessment.
+   - The website crash event is NOT in the calendar in advance — it arrives ONLY via tech_ping.
 
 ---
 
 HOW TO USE SHARED KNOWLEDGE:
 - baseline_environment: Use target_cpa, baseline_cvr, baseline_cpc, market_ceiling_cpc to assess deviations.
 - market_patterns: Match observed behavior to patterns (holiday_surge, landing_page_failure, competitive_bid_spike, normal_noise).
-- historical_incidents: Reference lessons learned (cvr_crash_overreaction, late_day_underspend, holiday_underbidding) to avoid misclassification.
-- volatility_regimes: Classify into stable, negative_shock, or positive_surge using cvr_multiplier_range.
+- historical_incidents: Reference lessons learned to avoid misclassification.
+- volatility_regimes: Classify into stable, negative_shock, or positive_surge using cvr_multiplier_range and known information (website crash, holiday period, etc.).
 - efficiency_relationships: Apply leakage_condition (CPA > target AND CVR < baseline = toxic spend).
-- noise_model_assumptions: Require confirmation before treating single-hour moves as structural; avoid overreaction.
+- noise_model_assumptions: Require confirmation before treating single-hour moves as structural.
 - utility_intuition: Interpret metrics in terms of lead_value, cpa_penalty_weight, leakage_penalty_weight.
 
 HOW TO USE POLICY CONTEXT:
-- optimization_objective: F = U - λ·P; understand volume_score, cpa_penalty, leakage_penalty, budget_penalty.
+- optimization_objective: F = U + Pacing Score; understand volume_value, cpa_penalty, leakage_penalty, no_conversion_penalty, and pacing reward/overspend penalty.
 - cpa_efficiency_policy: Target CPA 80, acceptable band, hard threshold 120.
 - budget_pacing_policy: Overspend/underspend tolerances; late_day_priority_increase.
 - volatility_response_policy: CVR drop thresholds (moderate 40%, severe 70%); positive_surge_multiplier.
@@ -147,6 +271,8 @@ Required output fields:
     "metric_interpretation": "...",
     "knowledge_reference": "...",
     "policy_reference": "...",
+    "event_calendar_reference": "...",
+    "tech_ping_interpretation": "...",
     "uncertainty_notes": "..."
   },
   "confidence_score": 0.0-1.0,
@@ -154,17 +280,22 @@ Required output fields:
 }
 
 Guidelines:
+- technology_ping takes PRIORITY over market data inference for technology_impact.
+- event_calendar cross-reference is MANDATORY — always check current_day vs event windows.
 - Use shared knowledge to classify regime and match market patterns.
-- Reference policy thresholds when assessing efficiency, pacing, and escalation risk.
-- Distinguish noise from structural change using noise_model_assumptions and historical_incidents.
+- Distinguish noise from structural change using noise_model_assumptions.
 - Be economically rational and remain neutral and analytical.
+
+---
+
+SHARED_KNOWLEDGE:
+""" + json.dumps(self._extract_relevant_knowledge()) + """
+
+POLICY_CONTEXT:
+""" + json.dumps(self._extract_relevant_policy()) + """
 """
 
     def _extract_relevant_knowledge(self) -> Dict[str, Any]:
-        """
-        Extract shared knowledge components relevant for analysis.
-        Uses baseline, patterns, incidents, regimes, and relationships.
-        """
         return {
             "baseline_environment": self.shared_knowledge.get("baseline_environment"),
             "market_patterns": self.shared_knowledge.get("market_patterns"),
@@ -174,13 +305,11 @@ Guidelines:
             "volatility_regimes": self.shared_knowledge.get("volatility_regimes"),
             "noise_model_assumptions": self.shared_knowledge.get("noise_model_assumptions"),
             "stakeholder_expectations": self.shared_knowledge.get("stakeholder_expectations"),
+            # Holiday calendar and event schedule — agents use this for anticipatory reasoning
+            "event_calendar": self.shared_knowledge.get("event_calendar"),
         }
 
     def _extract_relevant_policy(self) -> Dict[str, Any]:
-        """
-        Extract policy components relevant for analysis.
-        Uses optimization objective, efficiency, pacing, volatility, risk, escalation, and noise rules.
-        """
         return {
             "optimization_objective": self.policy.get("optimization_objective"),
             "cpa_efficiency_policy": self.policy.get("cpa_efficiency_policy"),
@@ -198,19 +327,3 @@ Guidelines:
     def _log_analysis(self, analysis: Dict[str, Any]) -> None:
         with open(self.log_path, "a") as f:
             f.write(json.dumps(analysis) + "\n")
-
-
-## IGNORE THIS CODE BELOW ##
-# _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# test_analyst = Analyst(
-#     shared_knowledge_path=os.path.join(_SCRIPT_DIR, "knowledge", "shared_knowledge.json"),
-#     policy_path=os.path.join(_SCRIPT_DIR, "knowledge", "policy_db.json"),
-#     log_path=os.path.join(_SCRIPT_DIR, "logs", "analyst_log.jsonl"),
-# )
-
-# test_analyst.analyze(
-#     historical_df=pd.read_csv("data/ib_results.csv"),
-#     tech_ping=None,
-# )
-## IGNORE THIS CODE ABOVE ##    

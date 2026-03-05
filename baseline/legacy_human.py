@@ -21,6 +21,7 @@ def apply_human_intervener(
     env: SandboxEnv,
     current_hour: int,
     scheduler: VolatilityScheduler,
+    enable_12h_low_util_check: bool = True,
 ) -> None:
     """
     Smarter Marketer Implementation:
@@ -35,12 +36,15 @@ def apply_human_intervener(
     latest = state_history[-1]
 
     # --- A. DAILY ROUTINE CHECK (Every 12 Hours) ---
-    history_24h = state_history[-96:]
-    if history_24h:
-        rolling_spend = sum(s.market_outcome.spend for s in history_24h)
-        if rolling_spend < (latest.biz_inputs.daily_budget * 0.5):
-            print(f"[Human Audit] Hour {current_hour}: Low utilization detected. Resetting bid to {INITIAL_MAX_BID}.")
-            env.configure(max_bid=INITIAL_MAX_BID)
+    # Optional switch for hybrid controllers that want baseline human behavior
+    # but without periodic low-utilization bid reset.
+    if enable_12h_low_util_check:
+        history_24h = state_history[-96:]
+        if history_24h:
+            rolling_spend = sum(s.market_outcome.spend for s in history_24h)
+            if rolling_spend < (latest.biz_inputs.daily_budget * 0.5):
+                print(f"[Human Audit] Hour {current_hour}: Low utilization detected. Resetting bid to {INITIAL_MAX_BID}.")
+                env.configure(max_bid=INITIAL_MAX_BID)
 
     # --- B. WEEKLY EFFICIENCY REVIEW (Every 168 Hours / 7 Days) ---
     if current_hour > 0 and current_hour % 168 == 0:
