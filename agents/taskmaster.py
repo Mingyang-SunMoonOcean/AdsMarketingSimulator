@@ -30,7 +30,7 @@ class Taskmaster:
     # Set at 4.50 CHF — above the competitive CPC threshold (~4.15 CHF) — so the
     # campaign re-enters competitive auctions immediately rather than crawling up
     # from 0.50 CHF over 32+ virtual hours.
-    RECOVERY_BID_FLOOR: float = 4.50
+    RECOVERY_BID_FLOOR: float = 4.20
     POST_HOLIDAY_STABILIZATION_HOURS: int = 24
     POST_HOLIDAY_MAX_UP_RAMP: float = 1.15
 
@@ -56,9 +56,9 @@ class Taskmaster:
         # Emergency tracking: enables recovery floor after any bid-pause.
         self._was_emergency: bool = False
         # Countdown of OODA cycles during which the recovery floor stays active.
-        # Set to 4 whenever a bid-pause ends (emergency OR budget depletion).
-        # This ensures at least 4 cycles (8–16 virtual hours) of competitive floor
-        # even if the first recovery cycle itself depletes the budget.
+        # Set to 2 whenever a bid-pause ends (emergency OR budget depletion).
+        # This ensures a short deterministic relaunch while avoiding prolonged
+        # expensive over-bidding after recovery.
         self._recovery_cycles_remaining: int = 0
 
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
@@ -149,7 +149,26 @@ class Taskmaster:
                     "Post-holiday stabilization: capped upward bid ramp to +15% for smoother transition."
                 )
 
-        # ── 5. Budget safety: throttle before hard stop ──────────────────────
+        # ── 5. Efficiency guardrail: trim bids during sustained high CPA ───────
+        history_24h = state_history[-96:]
+        if mode not in ["EMERGENCY", "EMERGENCY_OVERRIDE"] and history_24h:
+            spend_24h = float(sum(s.market_outcome.spend for s in history_24h))
+            leads_24h = float(sum(s.market_outcome.leads for s in history_24h))
+            clicks_24h = float(sum(s.market_outcome.clicks for s in history_24h))
+            cpa_24h = (spend_24h / leads_24h) if leads_24h > 0 else float("inf")
+            if clicks_24h >= 40:
+                if cpa_24h >= 120.0:
+                    final_bid = min(final_bid, max(0.50, old_bid * 0.80))
+                    safety_notes.append(
+                        f"Efficiency guardrail hard-cut: rolling 24h CPA={cpa_24h:.2f} >= 120.00, capping bid to 80% of prior."
+                    )
+                elif cpa_24h >= 100.0:
+                    final_bid = min(final_bid, max(0.50, old_bid * 0.90))
+                    safety_notes.append(
+                        f"Efficiency guardrail soft-cut: rolling 24h CPA={cpa_24h:.2f} >= 100.00, capping bid to 90% of prior."
+                    )
+
+        # ── 6. Budget safety: throttle before hard stop ──────────────────────
         # Replace unconditional pause with a two-tier throttle unless we are in
         # true emergency mode. This preserves auction participation while still
         # preventing runaway spend near budget depletion.
@@ -158,20 +177,20 @@ class Taskmaster:
             day_spend = float(latest.derived_variables.current_day_spend or 0.0)
             budget_ratio = (day_spend / current_budget) if current_budget > 0 else 0.0
             if budget_ratio >= 1.05:
-                final_bid = min(final_bid, max(0.50, old_bid * 0.20))
+                final_bid = min(final_bid, max(0.50, old_bid * 0.15))
                 safety_notes.append(
-                    "Daily budget critically depleted — applying hard throttle (20% of prior bid, floored at CHF 0.50)."
+                    "Daily budget critically depleted — applying hard throttle (15% of prior bid, floored at CHF 0.50)."
                 )
             else:
-                final_bid = min(final_bid, max(1.50, old_bid * 0.40))
+                final_bid = min(final_bid, max(0.80, old_bid * 0.30))
                 safety_notes.append(
-                    "Daily budget near depleted — applying soft throttle (40% of prior bid, floored at CHF 1.50)."
+                    "Daily budget near depleted — applying soft throttle (30% of prior bid, floored at CHF 0.80)."
                 )
         elif is_budget_depleted:
             final_bid = 0.01
             safety_notes.append("Daily budget depleted during emergency — pausing bids until next calendar day.")
 
-        # ── 6. Update bid state ─────────────────────────────────────────────
+        # ── 7. Update bid state ─────────────────────────────────────────────
         self.current_state["max_bid"] = round(final_bid, 2)
 
         # Track whether a bid-pause just occurred (emergency or emergency-time
@@ -182,20 +201,20 @@ class Taskmaster:
         )
         if mode in ["EMERGENCY", "EMERGENCY_OVERRIDE"] or budget_depleted_pause:
             self._was_emergency = True
-            self._recovery_cycles_remaining = 4   # floor persists for 4 OODA cycles
+            self._recovery_cycles_remaining = 2   # floor persists for 2 OODA cycles
         else:
             self._was_emergency = False
             if self._recovery_cycles_remaining > 0:
                 self._recovery_cycles_remaining -= 1
 
-        # ── 7. Budget telemetry only ────────────────────────────────────────
+        # ── 8. Budget telemetry only ────────────────────────────────────────
         # Budget authority lives in Zupervisor. Taskmaster records budget-related
         # context for auditability but does not apply budget changes.
         proposed_budget = float(decision.get("suggested_daily_budget", current_budget))
         final_budget = None
         budget_reason = "zupervisor_only_budget_authority"
 
-        # ── 8. Audit log ────────────────────────────────────────────────────
+        # ── 9. Audit log ────────────────────────────────────────────────────
         report = {
             "timestamp": datetime.utcnow().isoformat(),
             "cycle": self.current_state["cycle_counter"],

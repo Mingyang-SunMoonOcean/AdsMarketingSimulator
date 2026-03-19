@@ -1,28 +1,12 @@
-{"timestamp": "2026-03-04T19:28:34.239308", "type": "budget_trigger", "virtual_hour": 444, "virtual_day": 19, "scheduler_event": "NORMAL", "current_budget": 700.0, "suggested_daily_budget": 1000.0, "suggested_max_bid": null, "reasons": ["holiday_prep: set holiday budget 24h before start"]}
-{"timestamp": "2026-03-04T19:35:22.351215", "day": 21, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:37:40.836641", "day": 22, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:39:50.809123", "day": 23, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:39:58.880512", "day": 6, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:42:00.679780", "type": "budget_trigger", "virtual_hour": 168, "virtual_day": 7, "scheduler_event": "NORMAL", "current_budget": 1000.0, "suggested_daily_budget": 700.0, "suggested_max_bid": null, "reasons": ["weekly_efficiency_cut: weekly CPA 105.58 > 96.00"]}
-{"timestamp": "2026-03-04T19:42:15.638687", "day": 24, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:45:12.895161", "day": 25, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:47:01.442340", "day": 11, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:48:14.730409", "day": 26, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:49:54.591739", "day": 16, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:50:35.182685", "type": "budget_trigger", "virtual_hour": 444, "virtual_day": 19, "scheduler_event": "NORMAL", "current_budget": 700.0, "suggested_daily_budget": 1000.0, "suggested_max_bid": null, "reasons": ["holiday_prep: set holiday budget 24h before start"]}
-{"timestamp": "2026-03-04T19:53:30.428067", "day": 27, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:54:53.484067", "day": 21, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:58:42.724314", "type": "budget_trigger", "virtual_hour": 504, "virtual_day": 21, "scheduler_event": "HOLIDAY", "current_budget": 1000.0, "suggested_daily_budget": 700.0, "suggested_max_bid": null, "reasons": ["weekly_efficiency_cut: weekly CPA 150.00 > 96.00"]}
-{"timestamp": "2026-03-04T19:58:46.154913", "day": 31, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T19:58:53.918054", "day": 22, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T20:02:13.906141", "day": 23, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T20:05:14.921937", "type": "budget_trigger", "virtual_hour": 840, "virtual_day": 35, "scheduler_event": "NORMAL", "current_budget": 1000.0, "suggested_daily_budget": 700.0, "suggested_max_bid": null, "reasons": ["weekly_efficiency_cut: weekly CPA 127.05 > 96.00"]}
-{"timestamp": "2026-03-04T20:05:26.720250", "day": 36, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T20:06:32.002592", "day": 24, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T20:09:14.315139", "day": 25, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T20:14:47.742941", "day": 26, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T20:16:55.704776", "day": 27, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T20:17:48.146832", "type": "budget_trigger", "virtual_hour": 636, "virtual_day": 27, "scheduler_event": "NORMAL", "current_budget": 700.0, "suggested_daily_budget": 1000.0, "suggested_max_bid": null, "reasons": ["holiday_reset: reset baseline budget after holiday cooldown"]}
-{"timestamp": "2026-03-04T20:23:32.017927", "day": 31, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
-{"timestamp": "2026-03-04T20:27:52.585892", "type": "budget_trigger", "virtual_hour": 840, "virtual_day": 35, "scheduler_event": "NORMAL", "current_budget": 1000.0, "suggested_daily_budget": 700.0, "suggested_max_bid": null, "reasons": ["weekly_efficiency_cut: weekly CPA 138.34 > 96.00"]}
-{"timestamp": "2026-03-04T20:28:00.516164", "day": 36, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T09:29:41.545749", "day": 6, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T09:34:30.003373", "day": 11, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T09:36:43.921903", "day": 16, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T09:39:21.388710", "day": 21, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T09:41:53.299046", "day": 22, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T10:01:44.893627", "day": 23, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T10:04:10.401689", "day": 24, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T10:06:30.148002", "day": 25, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T10:25:46.725408", "day": 26, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T10:27:41.805908", "day": 27, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T10:32:48.266242", "day": 31, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
+{"timestamp": "2026-03-18T10:39:45.422982", "day": 36, "action": "MONITOR", "reasoning": "Strategic heartbeat. Budget updates are handled by evaluate_budget_triggers()."}
