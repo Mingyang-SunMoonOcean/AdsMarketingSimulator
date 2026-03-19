@@ -209,6 +209,17 @@ in recent_window_data:
     Sub-competitive bids produce reduced activity identical to market downturns or outages
     in the raw metrics — you MUST check bid level before inferring any external failure.
 
+EFFICIENCY ESCALATION RULE (MANDATORY):
+Use rolling_24h_lookback_context to compute:
+  - rolling_24h_cpa = total_spend / max(total_leads, 1)
+  - rolling_24h_clicks = total_clicks
+If ALL conditions hold:
+  1) rolling_24h_clicks >= 40
+  2) rolling_24h_cpa >= 120 CHF
+  3) at least one max_bid in recent_window_data is >= 4.20 CHF
+then summary_signal MUST be "LEAKAGE_RISK" (not EFFICIENCY_DRIFT).
+This prevents prolonged high-bid, high-CPA drift from being misclassified as benign noise.
+
 ---
 
 HOW TO USE EXTERNAL SIGNALS:

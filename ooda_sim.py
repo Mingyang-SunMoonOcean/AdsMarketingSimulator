@@ -6,6 +6,8 @@ import os
 import csv
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
+
 from core.sandbox_env import SandboxEnv
 from core.state_manager import SimulationState
 from core.volatility_scheduler import VolatilityScheduler, HOLIDAY_HOURS
@@ -13,6 +15,7 @@ from agents.analyst import Analyst
 from agents.strategist import Strategist
 from agents.taskmaster import Taskmaster
 from agents.zupervisor import Zupervisor
+from logic.optimization import calculate_opti_function
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +59,10 @@ POST_HOLIDAY_OODA_STEP_INTERVAL = 2 * STEPS_PER_HOUR         # temporary 2h cade
 POST_HOLIDAY_STABILIZATION_HOURS = 24                        # stabilization window length
 ZUPERVISOR_INTERVAL         = 5 * HOURS_PER_DAY * STEPS_PER_HOUR  # every 5 virtual days
 HOLIDAY_ZUPERVISOR_INTERVAL = HOURS_PER_DAY * STEPS_PER_HOUR     # every 1 virtual day during holiday
+WINDOW_SIZE = STEPS_PER_HOUR
+DEBUG_LOG_INTERVAL_HOURS = int(os.getenv("OODA_DEBUG_LOG_INTERVAL_HOURS", "6"))
+DEBUG_GAP_STOP_THRESHOLD = os.getenv("OODA_DEBUG_GAP_STOP_THRESHOLD")
+DEBUG_COMPARE_START_HOUR = int(os.getenv("OODA_DEBUG_COMPARE_START_HOUR", "168"))
 
 # Agent knowledge / log paths — absolute so agents work from any CWD
 _AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
@@ -65,6 +72,11 @@ ANALYST_LOG_PATH = os.path.join(_AGENTS_DIR, "logs", "analyst_log.jsonl")
 STRATEGIST_LOG_PATH = os.path.join(_AGENTS_DIR, "logs", "strategist_log.jsonl")
 TASKMASTER_LOG_PATH = os.path.join(_AGENTS_DIR, "logs", "taskmaster_log.jsonl")
 ZUPERVISOR_LOG_PATH = os.path.join(_AGENTS_DIR, "logs", "zupervisor_log.jsonl")
+IB_CUMULATIVE_REFERENCE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "data",
+    "optimization_function_results.csv",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +181,53 @@ def _clear_log_files() -> None:
         open(path, "w").close()  # truncate
 
 
+def _load_ib_cumulative_reference() -> Dict[int, float]:
+    """
+    Load hour -> cumulative F for Industry Baseline from optimization CSV.
+    Returns empty dict if file is missing or malformed.
+    """
+    if not os.path.exists(IB_CUMULATIVE_REFERENCE_PATH):
+        return {}
+
+    ib_cumulative_by_hour: Dict[int, float] = {}
+    try:
+        with open(IB_CUMULATIVE_REFERENCE_PATH, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("source") != "IB":
+                    continue
+                hour = int(float(row["hour"]))
+                ib_cumulative_by_hour[hour] = float(row["cumulative_f"])
+    except (ValueError, KeyError):
+        return {}
+
+    return ib_cumulative_by_hour
+
+
+def _compute_latest_hourly_f(state_history: List[SimulationState]) -> Optional[float]:
+    """Compute optimization F for the most recent completed 1-hour window."""
+    if len(state_history) < WINDOW_SIZE:
+        return None
+
+    window = state_history[-WINDOW_SIZE:]
+    rows = [
+        {
+            "current_hour": s.market_outcome.current_hour,
+            "current_day": s.market_outcome.current_day,
+            "clicks": s.market_outcome.clicks,
+            "leads": s.market_outcome.leads,
+            "spend": s.market_outcome.spend,
+            "daily_budget": s.biz_inputs.daily_budget,
+            "volatility": s.external_events_inputs.volatility,
+        }
+        for s in window
+    ]
+    window_df = pd.DataFrame(rows)
+    hour = int(window_df["current_hour"].mean())
+    is_holiday = HOLIDAY_HOURS[0] <= hour <= HOLIDAY_HOURS[1]
+    return float(calculate_opti_function(window_df, is_holiday))
+
+
 # ---------------------------------------------------------------------------
 # Main simulation
 # ---------------------------------------------------------------------------
@@ -236,6 +295,14 @@ def run_ooda_simulation(
     )
 
     env.configure(daily_budget=initial_daily_budget, max_bid=initial_max_bid)
+    ib_cumulative_by_hour = _load_ib_cumulative_reference()
+    gap_stop_threshold = (
+        float(DEBUG_GAP_STOP_THRESHOLD)
+        if DEBUG_GAP_STOP_THRESHOLD is not None
+        else None
+    )
+    cumulative_f_mas = 0.0
+    last_logged_hour = -1
 
     # Persist the latest tech ping across steps so the Analyst always sees the
     # most current alert (CRASH stays active; RECOVERY clears it after one cycle).
@@ -246,16 +313,50 @@ def run_ooda_simulation(
 
     for step in range(total_steps):
         # Advance the simulation by one 15-minute tick
-        # Print current step number, virtual hour, and virtual day
-        print(f"Step {step}, Virtual Hour {env.clock.current_hour}, Virtual Day {env.clock.current_day}")
         env.act()
         state_history = env.observe()
+        current_hour = env.clock.current_hour
+
+        # Compute per-hour optimization function as soon as each full hour closes.
+        if (step + 1) % WINDOW_SIZE == 0 and len(state_history) >= WINDOW_SIZE:
+            latest_f = _compute_latest_hourly_f(state_history)
+            if latest_f is not None and current_hour >= DEBUG_COMPARE_START_HOUR:
+                cumulative_f_mas += latest_f
+
+            if current_hour != last_logged_hour and current_hour >= DEBUG_COMPARE_START_HOUR:
+                should_log = (
+                    current_hour % max(1, DEBUG_LOG_INTERVAL_HOURS) == 0
+                    or current_hour % 24 == 0
+                    or current_hour == DEBUG_COMPARE_START_HOUR
+                    or current_hour in (HOLIDAY_HOURS[0], HOLIDAY_HOURS[1])
+                )
+                if should_log:
+                    ib_cum = ib_cumulative_by_hour.get(current_hour)
+                    if ib_cum is not None:
+                        gap = cumulative_f_mas - ib_cum
+                        print(
+                            f"[Debug F] h={current_hour:>3} d={env.clock.current_day:>2} "
+                            f"MAS_cumF={cumulative_f_mas:>10.2f} "
+                            f"IB_cumF={ib_cum:>10.2f} gap={gap:>10.2f}"
+                        )
+                        if gap_stop_threshold is not None and gap <= gap_stop_threshold:
+                            print(
+                                f"[Debug F] Early stop triggered: gap {gap:.2f} "
+                                f"<= threshold {gap_stop_threshold:.2f}"
+                            )
+                            break
+                    else:
+                        print(
+                            f"[Debug F] h={current_hour:>3} d={env.clock.current_day:>2} "
+                            f"MAS_cumF={cumulative_f_mas:>10.2f} "
+                            f"(IB reference unavailable for this hour)"
+                        )
+                last_logged_hour = current_hour
 
         # ------------------------------------------------------------------
         # Tech monitoring — checked every step for precise lag tracking.
         # Holiday calendar is in shared_knowledge; only crashes go via ping.
         # ------------------------------------------------------------------
-        current_hour = env.clock.current_hour
         sched_event = scheduler.get_v_multiplier(current_hour)["event"]
         new_ping = tech_monitor.check(step, sched_event)
 

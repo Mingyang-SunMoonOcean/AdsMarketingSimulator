@@ -22,10 +22,16 @@ _API_TIMEOUT_S = 90.0  # per-request timeout passed to the SDK
 
 BID_FLOOR = 0.50       # CHF – absolute minimum bid (mirrors rule_engine)
 BID_CEILING = 20.00    # CHF – absolute maximum bid (mirrors rule_engine)
-MAX_BID_CHANGE_PCT = 0.30   # ±30 % per hour (risk_appetite_policy)
+MAX_BID_CHANGE_PCT = 0.20   # ±20 % per decision cycle for smoother control
 INITIAL_MAX_BID = 5.00      # Baseline human reset bid
 LOW_UTIL_CHECK_INTERVAL_HOURS = 12
 LOOKBACK_STEPS_24H = 96
+MIN_GUARDRAIL_CLICKS = 25
+NORMAL_MODE_MAX_UP = 1.12
+NORMAL_MODE_MAX_DN = 0.82
+OPPORTUNITY_MODE_MAX_UP = 1.20
+CPA_SOFT_CUT = 100.0
+CPA_HARD_CUT = 120.0
 
 
 class Strategist:
@@ -127,14 +133,23 @@ class Strategist:
         # self._system_prompt carries static policy/knowledge (built once in __init__)
         user_prompt = json.dumps(payload)
 
-        raw_decision = json.loads(self._call_llm([
+        raw_text = self._call_llm([
             {"role": "system", "content": self._system_prompt},
             {"role": "user", "content": user_prompt},
-        ]))
+        ])
+        raw_decision = self._decode_llm_json(
+            raw_text=raw_text,
+            analysis_result=analysis_result,
+            current_max_bid=current_max_bid,
+            current_daily_budget=current_daily_budget,
+        )
 
         # Step 3 – Constraint Mapping: clamp to policy hard limits
         decision = self._apply_constraints(
             raw_decision, current_max_bid, current_daily_budget
+        )
+        decision = self._apply_performance_guardrails(
+            decision, state_history, current_max_bid, current_daily_budget
         )
         decision = self._apply_low_utilization_reset(
             decision, state_history, current_max_bid, current_daily_budget
@@ -144,6 +159,7 @@ class Strategist:
 
         self._log_decision(decision)
         return decision
+
 
     # --------------------------------------------------
     # LLM call with timeout + retry
@@ -176,6 +192,122 @@ class Strategist:
                     flush=True,
                 )
                 time.sleep(delay)
+
+    def _decode_llm_json(
+        self,
+        raw_text: str,
+        analysis_result: Dict[str, Any],
+        current_max_bid: float,
+        current_daily_budget: float,
+    ) -> Dict[str, Any]:
+        """
+        Parse Strategist LLM output robustly.
+
+        Some responses can occasionally contain malformed JSON despite requesting
+        json_object response format. This method attempts safe recovery and falls
+        back to a deterministic policy so the simulation never crashes mid-run.
+        """
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            pass
+
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            cleaned = cleaned.replace("json\n", "", 1).strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+        extracted = self._extract_json_object(cleaned)
+        if extracted is not None:
+            try:
+                return json.loads(extracted)
+            except json.JSONDecodeError:
+                pass
+
+        print(
+            "[Strategist] WARNING: Invalid JSON from LLM response. "
+            "Using deterministic fallback decision for this cycle.",
+            flush=True,
+        )
+        return self._fallback_raw_decision(
+            analysis_result=analysis_result,
+            current_max_bid=current_max_bid,
+            current_daily_budget=current_daily_budget,
+        )
+
+    @staticmethod
+    def _extract_json_object(text: str) -> Optional[str]:
+        """Extract the first balanced JSON object from arbitrary text."""
+        start = text.find("{")
+        if start == -1:
+            return None
+
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        return None
+
+    def _fallback_raw_decision(
+        self,
+        analysis_result: Dict[str, Any],
+        current_max_bid: float,
+        current_daily_budget: float,
+    ) -> Dict[str, Any]:
+        """Deterministic fallback policy used only when LLM JSON is malformed."""
+        signal = str(analysis_result.get("summary_signal", "STABLE")).upper()
+
+        if signal == "TECH_FAILURE":
+            mode = "EMERGENCY"
+            multiplier = (0.01 / current_max_bid) if current_max_bid > 0 else 1.0
+            selected_policies = ["escalation_policy", "execution_constraints"]
+        elif signal == "POSITIVE_SURGE":
+            mode = "OPPORTUNITY"
+            multiplier = 1.10
+            selected_policies = ["volatility_response_policy", "risk_appetite_policy"]
+        elif signal in {"LEAKAGE_RISK", "NEGATIVE_SHOCK"}:
+            mode = "EMERGENCY"
+            multiplier = 0.85
+            selected_policies = ["cpa_efficiency_policy", "volatility_response_policy"]
+        else:
+            mode = "NORMAL"
+            multiplier = 1.00
+            selected_policies = ["risk_appetite_policy", "noise_protection_policy"]
+
+        suggested_max_bid = current_max_bid * multiplier if current_max_bid > 0 else BID_FLOOR
+        return {
+            "selected_mode": mode,
+            "selected_policies": selected_policies,
+            "bid_multiplier": float(multiplier),
+            "suggested_max_bid": float(suggested_max_bid),
+            "suggested_daily_budget": float(current_daily_budget),
+            "strategic_reasoning": (
+                "Fallback decision executed because LLM output JSON was malformed. "
+                f"Signal={signal}, selected_mode={mode}, base_multiplier={multiplier:.4f}."
+            ),
+        }
 
     # --------------------------------------------------
     # Shadow Price
@@ -504,6 +636,91 @@ SHARED_KNOWLEDGE_CONTEXT:
             + ("\n" if reasoning else "")
             + "Baseline low-utilization reset applied: rolling 24h spend below 50% budget, bid reset to CHF 5.00."
         )
+        return decision
+
+    def _apply_performance_guardrails(
+        self,
+        decision: Dict[str, Any],
+        state_history: List[SimulationState],
+        current_max_bid: float,
+        current_daily_budget: float,
+    ) -> Dict[str, Any]:
+        """
+        Deterministic anti-oscillation layer to keep bid moves economically sane.
+
+        The LLM can still choose mode and direction, but this guardrail ensures we
+        do not repeatedly overbid when 24h efficiency is clearly deteriorating.
+        """
+        if not state_history or current_max_bid <= 0:
+            return decision
+
+        window = state_history[-LOOKBACK_STEPS_24H:]
+        if not window:
+            return decision
+
+        spend_24h = sum(s.market_outcome.spend for s in window)
+        leads_24h = sum(s.market_outcome.leads for s in window)
+        clicks_24h = sum(s.market_outcome.clicks for s in window)
+        if clicks_24h < MIN_GUARDRAIL_CLICKS:
+            return decision
+
+        cpa_24h = (spend_24h / leads_24h) if leads_24h > 0 else float("inf")
+        spend_ratio = (spend_24h / current_daily_budget) if current_daily_budget > 0 else 0.0
+
+        mode = str(decision.get("selected_mode", "NORMAL")).upper()
+        multiplier = float(decision.get("bid_multiplier", 1.0))
+        notes = decision.get("constraint_notes", [])
+        if not isinstance(notes, list):
+            notes = [str(notes)]
+
+        if mode == "NORMAL":
+            bounded = max(NORMAL_MODE_MAX_DN, min(multiplier, NORMAL_MODE_MAX_UP))
+            if bounded != multiplier:
+                notes.append(
+                    f"normal_mode_smoothing: multiplier clamped {multiplier:.3f} → {bounded:.3f}."
+                )
+                multiplier = bounded
+        elif mode == "OPPORTUNITY":
+            bounded = min(multiplier, OPPORTUNITY_MODE_MAX_UP)
+            if bounded != multiplier:
+                notes.append(
+                    f"opportunity_mode_ceiling: multiplier clamped {multiplier:.3f} → {bounded:.3f}."
+                )
+                multiplier = bounded
+
+        # Efficiency-first correction: if 24h CPA is poor, never allow bid increases.
+        if cpa_24h >= CPA_HARD_CUT or (leads_24h == 0 and spend_24h > 1.5 * CPA_SOFT_CUT):
+            bounded = min(multiplier, 0.80)
+            if bounded != multiplier:
+                notes.append(
+                    f"efficiency_hard_cut: 24h CPA={cpa_24h:.2f}, forcing multiplier ≤ {bounded:.2f}."
+                )
+                multiplier = bounded
+        elif cpa_24h >= CPA_SOFT_CUT:
+            bounded = min(multiplier, 0.92)
+            if bounded != multiplier:
+                notes.append(
+                    f"efficiency_soft_cut: 24h CPA={cpa_24h:.2f}, forcing multiplier ≤ {bounded:.2f}."
+                )
+                multiplier = bounded
+
+        # Pacing protection: if we already overspent the rolling budget, suppress up-ramps.
+        if spend_ratio > 1.05:
+            bounded = min(multiplier, 0.90)
+            if bounded != multiplier:
+                notes.append(
+                    f"pacing_cut: rolling spend ratio={spend_ratio:.2f}, forcing multiplier ≤ {bounded:.2f}."
+                )
+                multiplier = bounded
+
+        suggested_bid = max(BID_FLOOR, min(current_max_bid * multiplier, BID_CEILING))
+        if abs(suggested_bid - current_max_bid) < 0.01:
+            suggested_bid = current_max_bid
+            multiplier = 1.0
+
+        decision["bid_multiplier"] = round(multiplier, 4)
+        decision["suggested_max_bid"] = round(suggested_bid, 2)
+        decision["constraint_notes"] = notes
         return decision
 
     # --------------------------------------------------
