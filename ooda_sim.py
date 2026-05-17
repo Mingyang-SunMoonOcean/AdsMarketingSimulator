@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import csv
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import numpy as np
 
 import pandas as pd
 
@@ -63,6 +65,7 @@ WINDOW_SIZE = STEPS_PER_HOUR
 DEBUG_LOG_INTERVAL_HOURS = int(os.getenv("OODA_DEBUG_LOG_INTERVAL_HOURS", "6"))
 DEBUG_GAP_STOP_THRESHOLD = os.getenv("OODA_DEBUG_GAP_STOP_THRESHOLD")
 DEBUG_COMPARE_START_HOUR = int(os.getenv("OODA_DEBUG_COMPARE_START_HOUR", "168"))
+RUN_HEARTBEAT_HOURS = int(os.getenv("OODA_RUN_HEARTBEAT_HOURS", "1"))
 
 # Agent knowledge / log paths — absolute so agents work from any CWD
 _AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
@@ -77,6 +80,31 @@ IB_CUMULATIVE_REFERENCE_PATH = os.path.join(
     "data",
     "optimization_function_results.csv",
 )
+
+
+def apply_ooda_bid_schedule_hour_tick(
+    env: SandboxEnv,
+    step: int,
+    ooda_fired_this_step: bool,
+    bid_schedule: Optional[List[float]],
+    schedule_next_idx: int,
+) -> int:
+    """
+    Apply the next pre-computed hourly max_bid at virtual hour boundaries.
+
+    When OODA fires on the same step as a boundary, the first slot is applied
+    inside the OODA block; this helper skips to avoid double-advancing.
+    """
+    if not bid_schedule:
+        return schedule_next_idx
+    if (step + 1) % STEPS_PER_HOUR != 0:
+        return schedule_next_idx
+    if ooda_fired_this_step:
+        return schedule_next_idx
+    if schedule_next_idx < len(bid_schedule):
+        env.configure(max_bid=float(bid_schedule[schedule_next_idx]))
+        return schedule_next_idx + 1
+    return schedule_next_idx
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +264,7 @@ def run_ooda_simulation(
     total_steps: int = TOTAL_STEPS,
     initial_max_bid: float = INITIAL_MAX_BID,
     initial_daily_budget: float = INITIAL_DAILY_BUDGET,
+    seed: Optional[Union[int, np.random.Generator]] = None,
 ) -> Tuple[List[SimulationState], dict]:
     """
     Run the OODA MAS simulation (Phase 2).
@@ -270,7 +299,7 @@ def run_ooda_simulation(
     _clear_log_files()
 
     scheduler = VolatilityScheduler()
-    env = SandboxEnv(scheduler=scheduler)
+    env = SandboxEnv(scheduler=scheduler, seed=seed)
     tech_monitor = TechMonitor()
 
     analyst = Analyst(
@@ -310,12 +339,27 @@ def run_ooda_simulation(
     # Track TechMonitor state across steps to detect one-shot transitions
     # (CRASH_ACTIVE entry and RECOVERY confirmation) without re-firing on every step.
     _prev_tech_state: str = "NORMAL"
+    mas_bid_schedule: Optional[List[float]] = None
+    mas_schedule_next_idx: int = 0
+    last_ooda_context: Optional[Dict[str, Any]] = None
 
     for step in range(total_steps):
         # Advance the simulation by one 15-minute tick
         env.act()
         state_history = env.observe()
         current_hour = env.clock.current_hour
+        if (step + 1) % (max(1, RUN_HEARTBEAT_HOURS) * STEPS_PER_HOUR) == 0:
+            latest = state_history[-1]
+            progress_pct = 100.0 * (step + 1) / max(1, total_steps)
+            print(
+                f"[OODA Run] step={step + 1}/{total_steps} ({progress_pct:5.1f}%) "
+                f"day={latest.market_outcome.current_day:>2} hour={current_hour:>3} "
+                f"event={scheduler.get_v_multiplier(current_hour)['event']:<7} "
+                f"bid={latest.biz_inputs.max_bid:>5.2f} "
+                f"day_spend={latest.derived_variables.current_day_spend:>7.2f}/"
+                f"{latest.biz_inputs.daily_budget:>7.2f}",
+                flush=True,
+            )
 
         # Compute per-hour optimization function as soon as each full hour closes.
         if (step + 1) % WINDOW_SIZE == 0 and len(state_history) >= WINDOW_SIZE:
@@ -426,6 +470,7 @@ def run_ooda_simulation(
             not in_disruption
             and (step + 1) % effective_interval == 0
         )
+        ooda_fired_this_step = False
 
         # ------------------------------------------------------------------
         # Loop A: OODA cycle
@@ -438,9 +483,19 @@ def run_ooda_simulation(
             (regular_ooda_tick or is_crash_newly_active or is_recovery_confirmed)
             and len(state_history) >= STEPS_PER_HOUR
         ):
+            ooda_fired_this_step = True
+            schedule_hours = (
+                1
+                if (is_crash_newly_active or is_recovery_confirmed)
+                else max(1, effective_interval // STEPS_PER_HOUR)
+            )
 
-            # Observe — Analyst interprets state_history + optional tech ping
-            analysis_result = analyst.analyze(state_history, tech_ping=active_tech_ping)
+            analysis_result = analyst.analyze(
+                state_history,
+                tech_ping=active_tech_ping,
+                previous_ooda=last_ooda_context,
+                ooda_schedule_horizon_hours=schedule_hours,
+            )
 
             # Attach virtual simulation hour so Strategist's shadow price
             # λ = exp(t/24) tracks simulation time, not real wall-clock UTC.
@@ -450,14 +505,36 @@ def run_ooda_simulation(
             # Orient + Decide — Strategist reads current bid/budget from state_history
             decision = strategist.decide(analysis_result, state_history)
 
-            # Act — Taskmaster enforces guardrails, receives everything directly
-            execution = taskmaster.execute_cycle(state_history, analysis_result, decision)
-            env.configure(max_bid=execution["bid_execution"]["actual"])
+            # Act — Taskmaster enforces guardrails + optional intra-interval bid path
+            execution = taskmaster.execute_cycle(
+                state_history, analysis_result, decision, schedule_hours=schedule_hours
+            )
+            mas_bid_schedule = execution.get("bid_schedule") or [
+                float(execution["bid_execution"]["actual"])
+            ]
+            mas_schedule_next_idx = 1
+            env.configure(max_bid=float(execution["bid_execution"]["actual"]))
+            last_ooda_context = {
+                "virtual_hour": int(env.clock.current_hour),
+                "virtual_day": int(env.clock.current_day),
+                "executed_anchor_bid": float(execution["bid_execution"]["actual"]),
+                "mode": execution.get("mode_executed"),
+                "schedule_hours": int(schedule_hours),
+                "bid_schedule": list(mas_bid_schedule),
+            }
 
             # Clear one-shot RECOVERY ping after it has been processed
             if (active_tech_ping is not None
                     and active_tech_ping.get("event") == "RECOVERY"):
                 active_tech_ping = None
+
+        mas_schedule_next_idx = apply_ooda_bid_schedule_hour_tick(
+            env=env,
+            step=step,
+            ooda_fired_this_step=ooda_fired_this_step,
+            bid_schedule=mas_bid_schedule,
+            schedule_next_idx=mas_schedule_next_idx,
+        )
 
         # ------------------------------------------------------------------
         # Loop B: Zupervisor strategic review — every 5 virtual days,

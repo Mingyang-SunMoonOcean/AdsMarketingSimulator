@@ -22,7 +22,9 @@ CRASH_END_HOUR = WEBSITE_CRASH_HOURS[1]
 HOLIDAY_START_HOUR = HOLIDAY_HOURS[0]
 HOLIDAY_END_HOUR = HOLIDAY_HOURS[1]
 INITIAL_DAILY_BUDGET = 1000.0
-HOLIDAY_DAILY_BUDGET = 1000.0
+# Higher than IB's nominal CHF 1000 holiday cap so MAS can sustain competitive bids
+# through full surge days without repeated budget-depletion throttles.
+HOLIDAY_DAILY_BUDGET = 1650.0
 
 
 class Zupervisor:
@@ -63,6 +65,16 @@ class Zupervisor:
         total_leads = sum(s.market_outcome.leads for s in weekly_history)
         return total_spend / total_leads if total_leads > 0 else float("inf")
 
+    @staticmethod
+    def _window_overlaps_range(
+        window_start_hour: int,
+        window_end_hour: int,
+        range_start_hour: int,
+        range_end_hour: int,
+    ) -> bool:
+        """True when [window_start_hour, window_end_hour] intersects [range_start_hour, range_end_hour]."""
+        return not (window_end_hour < range_start_hour or window_start_hour > range_end_hour)
+
     def evaluate_budget_triggers(
         self,
         current_hour: int,
@@ -90,8 +102,18 @@ class Zupervisor:
             and current_hour % 168 == 0
             and current_hour != self._last_weekly_review_hour
         ):
+            weekly_start = current_hour - 167
+            weekly_end = current_hour
+            overlaps_crash = self._window_overlaps_range(
+                weekly_start, weekly_end, WEBSITE_CRASH_HOURS[0], WEBSITE_CRASH_HOURS[1]
+            )
+            # Avoid suppressing holiday capture with weekly cuts when crash contamination
+            # or in-holiday windows distort the weekly CPA signal.
+            overlaps_holiday = self._window_overlaps_range(
+                weekly_start, weekly_end, HOLIDAY_HOURS[0], HOLIDAY_HOURS[1]
+            )
             weekly_cpa = self._weekly_cpa(state_history)
-            if weekly_cpa > TARGET_CPA * 1.2:
+            if weekly_cpa > TARGET_CPA * 1.2 and not (overlaps_crash or overlaps_holiday):
                 suggested_budget = current_budget * BUDGET_CUT_FACTOR
                 reasons.append(
                     f"weekly_efficiency_cut: weekly CPA {weekly_cpa:.2f} > {TARGET_CPA * 1.2:.2f}"

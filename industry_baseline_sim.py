@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 
 import csv
-from typing import List, Tuple
+from typing import List, Optional, Tuple, Union
+
+import numpy as np
 
 from core.sandbox_env import SandboxEnv
 from core.state_manager import SimulationState
@@ -45,6 +47,7 @@ def run_industry_baseline_simulation(
     target_cpa: float = TARGET_CPA_CHF,
     initial_max_bid: float = INITIAL_MAX_BID,
     initial_daily_budget: float = INITIAL_DAILY_BUDGET,
+    seed: Optional[Union[int, np.random.Generator]] = None,
 ) -> Tuple[List[SimulationState], dict]:
     """
     Run the 37-day "Industry Baseline" simulation.
@@ -56,7 +59,7 @@ def run_industry_baseline_simulation(
     Returns a tuple of (state_history, aggregate_metrics).
     """
     scheduler = VolatilityScheduler()
-    env = SandboxEnv(scheduler=scheduler)
+    env = SandboxEnv(scheduler=scheduler, seed=seed)
 
     # Initial configuration
     env.configure(daily_budget=initial_daily_budget, max_bid=initial_max_bid)

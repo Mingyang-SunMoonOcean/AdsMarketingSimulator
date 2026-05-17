@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Optional, Union
+
 import numpy as np
 
 # Market physics constants for a premium car dealership.
@@ -12,6 +16,9 @@ K = 1.2
 # base_clicks: base number of clicks for the car dealership (every 15 minutes).
 BASE_CLICKS = 5.0
 
+# Default global seed (used when no explicit seed is supplied).
+DEFAULT_SEED: int = 42
+
 
 class MarketPhysics:
     """
@@ -20,6 +27,10 @@ class MarketPhysics:
     This class does **not** own any state about bids or volatility itself:
     it always **reads** from the `StateManager` and **writes** outcomes back
     via `StateManager.record_outcome(...)`.
+
+    Pass ``seed`` (int or None) to get fully reproducible stochastic draws.
+    A fresh ``numpy.random.Generator`` is created per instance so multiple
+    parallel/sequential simulations do not share RNG state.
     """
 
     def __init__(
@@ -30,6 +41,7 @@ class MarketPhysics:
         k: float = K,
         # simulate 5 click per step (every 15 minutes)
         base_clicks: float = BASE_CLICKS,
+        seed: Optional[Union[int, np.random.Generator]] = None,
     ):
         # Market constants
         self.CPC_base = float(cpc_base)
@@ -37,6 +49,12 @@ class MarketPhysics:
         self.CVR_base = float(cvr_base)
         self.k = float(k)
         self.base_clicks = float(base_clicks)
+
+        # Per-instance RNG — reproducible when seed is provided.
+        if isinstance(seed, np.random.Generator):
+            self._rng = seed
+        else:
+            self._rng = np.random.default_rng(seed)
 
     def run_step(self, state_manager) -> dict:
         """
@@ -76,17 +94,23 @@ class MarketPhysics:
             return outcome
 
         # 1) Actual CPC (asymptotic saturation in bid)
-        cpc_act = np.random.uniform(self.CPC_base + (self.CPC_max - self.CPC_base) * (
-            1 - np.exp(-self.k * (b_max / self.CPC_max))
-        ))
+        cpc_act = self._rng.uniform(
+            0.0,
+            self.CPC_base + (self.CPC_max - self.CPC_base) * (
+                1 - np.exp(-self.k * (b_max / self.CPC_max))
+            ),
+        )
         cpc_act = min(cpc_act, b_max)
 
         # 2) Traffic volume (scaled by bid) + log-normal-ish noise
-        clicks = float(np.random.poisson(self.base_clicks
+        lam = max(
+            0.0,
+            self.base_clicks
             * (b_max / self.CPC_base)
-            * np.random.normal(1.0, 0.10))
+            * self._rng.normal(1.0, 0.10),
         )
-        clicks = max(0, clicks)
+        clicks = float(self._rng.poisson(lam))
+        clicks = max(0.0, clicks)
 
         # 3) Spend and leads
         spend = float(clicks) * float(cpc_act)
@@ -99,7 +123,7 @@ class MarketPhysics:
             clicks = int(clicks)
 
         cvr_effective = self.CVR_base * v_multiplier
-        leads = np.random.binomial(n=int(clicks), p=min(max(cvr_effective, 0.0), 1.0))
+        leads = self._rng.binomial(n=int(clicks), p=min(max(cvr_effective, 0.0), 1.0))
 
         outcome = {
             "realized_cpc": round(float(cpc_act), 4),
