@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError
 
 from core.state_manager import SimulationState
+from core.volatility_scheduler import HOLIDAY_HOURS
+from logic.optimization import calculate_pacing_score, calculate_utility
 
 # Retry config for transient OpenAI errors
 _MAX_ATTEMPTS = 5
@@ -86,6 +88,69 @@ class Analyst:
             for s in state_history
         ])
 
+    @staticmethod
+    def _compute_deterministic_f_alignment(
+        historical_df: pd.DataFrame,
+        previous_ooda: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Programmatic decomposition aligned with logic.optimization (F = U + pacing).
+        Supplied to the LLM and merged into the analysis output for downstream agents.
+        """
+        out: Dict[str, Any] = {}
+        if historical_df.empty:
+            return out
+
+        def _slice_metrics(label: str, n_rows: int) -> Dict[str, Any]:
+            sl = historical_df.tail(min(n_rows, len(historical_df)))
+            if sl.empty:
+                return {}
+            h = float(sl["current_hour"].mean())
+            is_hol = HOLIDAY_HOURS[0] <= h <= HOLIDAY_HOURS[1]
+            u = float(calculate_utility(sl, volume_bonus=1.0 if is_hol else 0.0))
+            p = float(calculate_pacing_score(sl))
+            f_tot = u + p
+            leads = float(sl["leads"].sum())
+            spend = float(sl["spend"].sum())
+            clicks = float(sl["clicks"].sum())
+            cpa = spend / leads if leads > 0 else None
+            cvr = leads / clicks if clicks > 0 else 0.0
+            v_mean = float(sl["volatility"].mean())
+            return {
+                "window_label": label,
+                "virtual_hour_mean": round(h, 2),
+                "F_total": round(f_tot, 4),
+                "utility": round(u, 4),
+                "pacing": round(p, 4),
+                "leads": int(leads),
+                "spend_chf": round(spend, 4),
+                "clicks": int(clicks),
+                "cpa_chf": round(cpa, 4) if cpa is not None else None,
+                "cvr": round(cvr, 6),
+                "zero_lead_spend_chf": round(spend, 4) if leads == 0 else 0.0,
+                "is_holiday_window": is_hol,
+                "is_crash_volatility": v_mean == 0.0,
+            }
+
+        out["last_1h"] = _slice_metrics("last_1h", 4)
+        out["last_4h"] = _slice_metrics("last_4h", 16)
+        out["last_24h"] = _slice_metrics("last_24h", 96)
+
+        if previous_ooda:
+            bid = float(previous_ooda.get("executed_anchor_bid") or 0.0)
+            out["retrospective_vs_prior_ooda"] = {
+                "prior_virtual_hour": previous_ooda.get("virtual_hour"),
+                "prior_virtual_day": previous_ooda.get("virtual_day"),
+                "prior_mode": previous_ooda.get("mode"),
+                "prior_anchor_bid_chf": round(bid, 2),
+                "instruction": (
+                    "In reasoning.metric_interpretation, briefly compare last_4h realized "
+                    "F_total / zero_lead_spend_chf vs the prior OODA anchor — "
+                    "did execution match intent?"
+                ),
+            }
+        return out
+
     # --------------------------------------------------
     # Main Entry Point
     # --------------------------------------------------
@@ -94,6 +159,8 @@ class Analyst:
         self,
         state_history: List[SimulationState],
         tech_ping: Optional[Dict[str, Any]] = None,
+        previous_ooda: Optional[Dict[str, Any]] = None,
+        ooda_schedule_horizon_hours: int = 4,
     ) -> Dict[str, Any]:
         """
         Observe and interpret the simulation state.
@@ -109,6 +176,10 @@ class Analyst:
         loopback_df = historical_df.tail(16)  # last 4 hours (16 steps)
         rolling_24h_lookback_df = historical_df.tail(96)  # last 24 hours (96 steps)
 
+        deterministic_f_alignment = self._compute_deterministic_f_alignment(
+            historical_df, previous_ooda
+        )
+
         # Only dynamic per-call data goes in the user message; static knowledge/policy
         # lives in self._system_prompt (built once in __init__) so it can be cached.
         payload = {
@@ -116,6 +187,9 @@ class Analyst:
             "loopback_context": loopback_df.to_dict(orient="records"),
             "rolling_24h_lookback_context": rolling_24h_lookback_df.to_dict(orient="records"),
             "technology_ping": tech_ping,
+            "deterministic_f_alignment": deterministic_f_alignment,
+            "previous_ooda_execution": previous_ooda,
+            "ooda_schedule_horizon_hours": int(max(1, ooda_schedule_horizon_hours)),
         }
 
         user_prompt = json.dumps(payload)
@@ -125,6 +199,10 @@ class Analyst:
             {"role": "user", "content": user_prompt},
         ])
         analysis_output = json.loads(raw)
+        analysis_output["deterministic_f_alignment"] = deterministic_f_alignment
+        analysis_output["ooda_schedule_horizon_hours"] = int(max(1, ooda_schedule_horizon_hours))
+        if previous_ooda is not None:
+            analysis_output["previous_ooda_execution"] = previous_ooda
         self._log_analysis(analysis_output)
         return analysis_output
 
@@ -175,6 +253,15 @@ Your role:
 - Assess efficiency, leakage risk, pacing status, and technology impact.
 - DO NOT suggest actions. DO NOT make decisions. Only analyze and interpret.
 
+DETERMINISTIC F-ALIGNMENT (in this message):
+- The user message includes "deterministic_f_alignment": pre-computed windows (last_1h, last_4h, last_24h)
+  with F_total, utility, pacing, zero_lead_spend_chf, CPA, CVR — same definitions as policy optimization_objective.
+- Use these numbers in reasoning.metric_interpretation; do not contradict them.
+- If "previous_ooda_execution" / retrospective_vs_prior_ooda is present, briefly assess whether the last interval
+  matched the prior OODA intent (volume vs toxic spend).
+- "ooda_schedule_horizon_hours" is how many virtual hours the Strategist may shape with an optional bid schedule;
+  mention it in reasoning if relevant (you still do not choose bids).
+
 ---
 
 CRITICAL — DISTINGUISHING SELF-INFLICTED BID SILENCE FROM REAL MARKET FAILURES:
@@ -220,6 +307,14 @@ If ALL conditions hold:
 then summary_signal MUST be "LEAKAGE_RISK" (not EFFICIENCY_DRIFT).
 This prevents prolonged high-bid, high-CPA drift from being misclassified as benign noise.
 
+HOLIDAY SURGE INTERPRETATION RULE (MANDATORY):
+- If event_calendar indicates the current_day is inside a known holiday window, you MUST:
+  1) explicitly reference the holiday in market_context_summary and event_calendar_reference,
+  2) avoid statements like "no known events" for that timestamp,
+  3) treat moderately elevated CPA as expected surge behavior unless hard leakage evidence is present.
+- During holiday windows, prefer summary_signal = "POSITIVE_SURGE" over "LEAKAGE_RISK"
+  unless the efficiency escalation rule above is fully satisfied.
+
 ---
 
 HOW TO USE EXTERNAL SIGNALS:
@@ -241,6 +336,8 @@ HOW TO USE EXTERNAL SIGNALS:
    - If current_day is within 1 day BEFORE an event: flag it in market_context_summary
      as an anticipatory warning ("Holiday period begins tomorrow — pre-emptive adjustment warranted").
    - If current_day is WITHIN an event window: reference expected_effect in your assessment.
+   - If current_day is WITHIN the holiday event window, your assessment must explicitly
+     say the system is in holiday demand surge context and align signal interpretation accordingly.
    - The website crash event is NOT in the calendar in advance — it arrives ONLY via tech_ping.
 
 ---

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from typing import Optional, Union
+
+import numpy as np
+
 from .market_physics import MarketPhysics
 from .state_manager import StateManager
 from .volatility_scheduler import VolatilityScheduler
@@ -12,6 +16,10 @@ class SandboxEnv:
     This is the single entry point for observing state and taking actions.
 
     Owns the shared ``WorldClock`` that every sub-system reads from.
+
+    Pass ``seed`` (int or None) to fully reproducible stochastic market draws.
+    The seed is forwarded to ``MarketPhysics``; if an explicit ``physics``
+    instance is already provided, ``seed`` is ignored.
     """
 
     def __init__(
@@ -20,10 +28,11 @@ class SandboxEnv:
         state: StateManager | None = None,
         scheduler: VolatilityScheduler | None = None,
         clock: WorldClock | None = None,
+        seed: Optional[Union[int, np.random.Generator]] = None,
     ):
         self.clock = clock or WorldClock()
         self.state = state or StateManager(clock=self.clock)
-        self.physics = physics or MarketPhysics()
+        self.physics = physics or MarketPhysics(seed=seed)
         self.scheduler = scheduler or VolatilityScheduler()
 
     def observe(self) -> list:

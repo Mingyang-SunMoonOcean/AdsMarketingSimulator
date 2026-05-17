@@ -14,6 +14,7 @@ from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError
 import pandas as pd
 
 from core.state_manager import SimulationState
+from core.volatility_scheduler import HOLIDAY_HOURS
 
 # Retry config for transient OpenAI errors
 _MAX_ATTEMPTS = 5
@@ -30,8 +31,11 @@ MIN_GUARDRAIL_CLICKS = 25
 NORMAL_MODE_MAX_UP = 1.12
 NORMAL_MODE_MAX_DN = 0.82
 OPPORTUNITY_MODE_MAX_UP = 1.20
+OPPORTUNITY_HOLIDAY_MAX_UP = 1.42
 CPA_SOFT_CUT = 100.0
 CPA_HARD_CUT = 120.0
+HOLIDAY_CPA_SOFT_CUT = 135.0
+HOLIDAY_CPA_HARD_CUT = 160.0
 
 
 class Strategist:
@@ -142,6 +146,9 @@ class Strategist:
             analysis_result=analysis_result,
             current_max_bid=current_max_bid,
             current_daily_budget=current_daily_budget,
+        )
+        raw_decision = self._apply_holiday_surge_mode_sync(
+            raw_decision, analysis_result, state_history
         )
 
         # Step 3 – Constraint Mapping: clamp to policy hard limits
@@ -420,7 +427,15 @@ You are to map the Analyst's SIGNAL and SEVERITY to a specific ACTION.
      floor will restore competitive bid levels — prioritize volume capture.
 ---
 
-GLASS-BOX REASONING REQUIREMENT:
+DETERMINISTIC INPUTS (use in GLASS-BOX layer 2):
+- analyst_signal.deterministic_f_alignment: pre-computed last_1h / last_4h / last_24h with
+  F_total (= utility + pacing), zero_lead_spend_chf, CPA, CVR. Treat as authoritative for math.
+- analyst_signal.retrospective_vs_prior_ooda: compare realized last interval vs prior OODA anchor.
+- ooda_schedule_horizon_hours: N = number of virtual hours until the next OODA cycle (same LLM cadence).
+  You may output an optional hourly_bid_schedule with exactly N CHF values shaping the path hour-by-hour.
+  If you omit it, Taskmaster interpolates smoothly from the current bid to suggested_max_bid.
+
+---
 The strategic_reasoning field MUST demonstrate all five reasoning layers:
 
   1. SIGNAL MAPPING  – State the summary_signal and which mode it triggers, citing
@@ -456,7 +471,8 @@ HARD CONSTRAINTS (enforced programmatically after your output):
 
 ---
 
-Output STRICTLY valid JSON with these fields only:
+Output STRICTLY valid JSON with these required fields
+(and optional hourly_bid_schedule when N = ooda_schedule_horizon_hours > 1):
 
 {
   "selected_mode": "NORMAL | EMERGENCY | OPPORTUNITY",
@@ -464,7 +480,8 @@ Output STRICTLY valid JSON with these fields only:
   "bid_multiplier": <float>,
   "suggested_max_bid": <float — current_max_bid × bid_multiplier, pre-constraint>,
   "suggested_daily_budget": <float — set equal to current_daily_budget_chf>,
-  "strategic_reasoning": "<multi-line glass-box explanation covering all 5 layers>"
+  "strategic_reasoning": "<multi-line glass-box explanation covering all 5 layers>",
+  "hourly_bid_schedule": <optional: array of exactly N floats in CHF; omit or null to use interpolation>
 }
 
 ---
@@ -495,6 +512,37 @@ SHARED_KNOWLEDGE_CONTEXT:
         }) + """
 """
 
+    @staticmethod
+    def _apply_holiday_surge_mode_sync(
+        raw: Dict[str, Any],
+        analysis_result: Dict[str, Any],
+        state_history: List[SimulationState],
+    ) -> Dict[str, Any]:
+        """
+        During calendar holiday, if the Analyst confirms POSITIVE_SURGE but the LLM
+        left mode on NORMAL/EFFICIENCY_DRIFT, promote to OPPORTUNITY so Taskmaster
+        holiday relaxations and opportunity ceilings apply consistently with IB-style
+        surge capture.
+        """
+        if not state_history:
+            return raw
+        h = int(state_history[-1].market_outcome.current_hour)
+        if not (HOLIDAY_HOURS[0] <= h <= HOLIDAY_HOURS[1]):
+            return raw
+        signal = str(analysis_result.get("summary_signal", "")).upper()
+        mode = str(raw.get("selected_mode", "NORMAL")).upper()
+        if signal != "POSITIVE_SURGE" or mode not in ("NORMAL", "EFFICIENCY_DRIFT"):
+            return raw
+        out = dict(raw)
+        out["selected_mode"] = "OPPORTUNITY"
+        note = (
+            "holiday_surge_mode_sync: POSITIVE_SURGE during holiday; "
+            "elevated NORMAL/EFFICIENCY_DRIFT → OPPORTUNITY."
+        )
+        prev = (out.get("strategic_reasoning") or "").strip()
+        out["strategic_reasoning"] = (prev + "\n" + note).strip() if prev else note
+        return out
+
     def _build_user_payload(
         self,
         analysis_result: Dict[str, Any],
@@ -506,6 +554,9 @@ SHARED_KNOWLEDGE_CONTEXT:
         """Package only dynamic per-call data; static policy/knowledge is in the system prompt."""
         return {
             "analyst_signal": analysis_result,
+            "ooda_schedule_horizon_hours": int(
+                max(1, analysis_result.get("ooda_schedule_horizon_hours", 4))
+            ),
             "current_campaign_state": {
                 "current_max_bid_chf": current_max_bid,
                 "current_daily_budget_chf": current_daily_budget,
@@ -582,7 +633,7 @@ SHARED_KNOWLEDGE_CONTEXT:
                 "suggested_daily_budget ignored (budget authority delegated to Zupervisor)."
             )
 
-        return {
+        out: Dict[str, Any] = {
             "selected_mode": raw.get("selected_mode", "NORMAL"),
             "selected_policies": raw.get("selected_policies", []),
             "bid_multiplier": round(multiplier, 4),
@@ -591,6 +642,10 @@ SHARED_KNOWLEDGE_CONTEXT:
             "strategic_reasoning": raw.get("strategic_reasoning", ""),
             "constraint_notes": notes if notes else ["No constraints violated."],
         }
+        hbs = raw.get("hourly_bid_schedule")
+        if isinstance(hbs, list) and hbs:
+            out["hourly_bid_schedule"] = hbs
+        return out
 
 
     def _apply_low_utilization_reset(
@@ -673,6 +728,12 @@ SHARED_KNOWLEDGE_CONTEXT:
         if not isinstance(notes, list):
             notes = [str(notes)]
 
+        current_hour_abs = int(state_history[-1].market_outcome.current_hour)
+        in_holiday = HOLIDAY_HOURS[0] <= current_hour_abs <= HOLIDAY_HOURS[1]
+        holiday_efficiency_relaxed = (
+            in_holiday and mode not in ("EMERGENCY", "EMERGENCY_OVERRIDE")
+        )
+
         if mode == "NORMAL":
             bounded = max(NORMAL_MODE_MAX_DN, min(multiplier, NORMAL_MODE_MAX_UP))
             if bounded != multiplier:
@@ -680,8 +741,10 @@ SHARED_KNOWLEDGE_CONTEXT:
                     f"normal_mode_smoothing: multiplier clamped {multiplier:.3f} → {bounded:.3f}."
                 )
                 multiplier = bounded
-        elif mode == "OPPORTUNITY":
-            bounded = min(multiplier, OPPORTUNITY_MODE_MAX_UP)
+
+        if mode == "OPPORTUNITY":
+            max_opportunity_up = OPPORTUNITY_HOLIDAY_MAX_UP if in_holiday else OPPORTUNITY_MODE_MAX_UP
+            bounded = min(multiplier, max_opportunity_up)
             if bounded != multiplier:
                 notes.append(
                     f"opportunity_mode_ceiling: multiplier clamped {multiplier:.3f} → {bounded:.3f}."
@@ -689,14 +752,16 @@ SHARED_KNOWLEDGE_CONTEXT:
                 multiplier = bounded
 
         # Efficiency-first correction: if 24h CPA is poor, never allow bid increases.
-        if cpa_24h >= CPA_HARD_CUT or (leads_24h == 0 and spend_24h > 1.5 * CPA_SOFT_CUT):
+        cpa_soft_cut = HOLIDAY_CPA_SOFT_CUT if holiday_efficiency_relaxed else CPA_SOFT_CUT
+        cpa_hard_cut = HOLIDAY_CPA_HARD_CUT if holiday_efficiency_relaxed else CPA_HARD_CUT
+        if cpa_24h >= cpa_hard_cut or (leads_24h == 0 and spend_24h > 1.5 * cpa_soft_cut):
             bounded = min(multiplier, 0.80)
             if bounded != multiplier:
                 notes.append(
                     f"efficiency_hard_cut: 24h CPA={cpa_24h:.2f}, forcing multiplier ≤ {bounded:.2f}."
                 )
                 multiplier = bounded
-        elif cpa_24h >= CPA_SOFT_CUT:
+        elif cpa_24h >= cpa_soft_cut:
             bounded = min(multiplier, 0.92)
             if bounded != multiplier:
                 notes.append(
@@ -705,7 +770,8 @@ SHARED_KNOWLEDGE_CONTEXT:
                 multiplier = bounded
 
         # Pacing protection: if we already overspent the rolling budget, suppress up-ramps.
-        if spend_ratio > 1.05:
+        # Skip during holiday (non-emergency) so surge capture is not muted vs IB.
+        if spend_ratio > 1.05 and not holiday_efficiency_relaxed:
             bounded = min(multiplier, 0.90)
             if bounded != multiplier:
                 notes.append(

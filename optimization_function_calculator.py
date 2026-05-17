@@ -6,7 +6,7 @@ Outputs
 data/optimization_function_graph.png   — per-hour F comparison (IB vs MAS vs Centaur)
 data/cumulative_f_graph.png            — cumulative F over time
 data/breakdown_graphs.png              — daily leads / spend / CPA breakdown
-data/aggregate_metrics.csv             — summary metrics table
+data/aggregate_metrics.csv             — summary metrics table (incl. mean F in first 24h after holiday)
 """
 
 import os
@@ -47,6 +47,9 @@ CRASH_DAY_END     = WEBSITE_CRASH_HOURS[1] / 24 + 1
 HOLIDAY_DAY_START = HOLIDAY_HOURS[0] / 24 + 1
 HOLIDAY_DAY_END   = HOLIDAY_HOURS[1] / 24 + 1
 
+# Mean F over the first N virtual hours after holiday ends (inclusive hour range).
+POST_HOLIDAY_AFTER_HOURS = 24
+
 
 # ---------------------------------------------------------------------------
 # Helper: add event shading to an axis
@@ -65,6 +68,13 @@ def _shade_events_days(ax, labeled: bool = True) -> None:
                color=C_CR,  label="Website Crash" if labeled else None, **kw)
     ax.axvspan(HOLIDAY_DAY_START, HOLIDAY_DAY_END,
                color=C_HOL, label="Holiday Surge"  if labeled else None, **kw)
+
+
+def _mean_f_in_hour_span(opti: pd.DataFrame, start_hour: float, end_hour: float) -> float:
+    """Mean hourly opti_function over rows with hour in [start_hour, end_hour] (inclusive)."""
+    mask = (opti["hour"] >= start_hour) & (opti["hour"] <= end_hour)
+    sub = opti.loc[mask, "opti_function"]
+    return float(sub.mean()) if len(sub) > 0 else float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +320,12 @@ def build_metrics_table(
             f_normal    = opti.loc[opti["event"] == "NORMAL",  "opti_function"].mean()
             f_holiday   = opti.loc[opti["event"] == "HOLIDAY", "opti_function"].mean()
             f_crash     = opti.loc[opti["event"] == "CRASH",   "opti_function"].mean()
+            post_holiday_start = float(HOLIDAY_HOURS[1] + 1)
+            post_holiday_end = float(HOLIDAY_HOURS[1] + POST_HOLIDAY_AFTER_HOURS)
+            f_after_holiday = _mean_f_in_hour_span(opti, post_holiday_start, post_holiday_end)
         else:
             total_f = mean_f = pct_pos = cumul_final = f_normal = f_holiday = f_crash = float("nan")
+            f_after_holiday = float("nan")
 
         rows.append({
             "Source":                label,
@@ -327,6 +341,7 @@ def build_metrics_table(
             "Mean F — Normal":       round(f_normal, 2),
             "Mean F — Holiday":      round(f_holiday, 2),
             "Mean F — Crash":        round(f_crash, 2),
+            f"Mean F — After holiday ({POST_HOLIDAY_AFTER_HOURS}h)": round(f_after_holiday, 2),
         })
 
     return pd.DataFrame(rows).set_index("Source")

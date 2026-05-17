@@ -1,0 +1,4 @@
+Source,Total Leads,Total Spend (CHF),Total Clicks,Overall CPA (CHF),Budget Utilisation (%),Total F,Mean F / window,% Positive F windows,Final Cumulative F,Mean F — Normal,Mean F — Holiday,Mean F — Crash,Mean F — After holiday (24h)
+Industry Baseline (IB),222,19873.89,9098,89.52,70.9,86091.0,119.57,48.6,86091.0,109.92,273.36,-19.12,141.88
+MAS (OODA),305,24457.32,10838,80.19,69.5,155438.0,215.89,51.7,155438.0,185.14,497.35,-0.24,235.44
+Centaur (CFL),352,25834.23,11746,73.39,73.4,185403.0,257.5,55.0,185403.0,236.36,551.63,-0.0,394.4
