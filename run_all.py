@@ -26,6 +26,9 @@ Output layout (inside --out-dir, default: data/)
 The canonical "current-run" files (data/*.csv / data/*.png) are also
 overwritten after each iteration so every other tool that reads from
 data/ always sees the latest result.
+
+After all runs, aggregate cross-run statistics and plots with:
+    python policy_comparator.py
 """
 
 from __future__ import annotations
