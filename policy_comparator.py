@@ -11,6 +11,9 @@ Usage
 -----
     python policy_comparator.py
     python policy_comparator.py --data-dir data --bootstrap 10000
+    python policy_comparator.py --exclude ""          # include every discovered run
+
+By default, stamp ``seed42_run2`` is excluded from cross-run comparison.
 """
 
 from __future__ import annotations
@@ -57,6 +60,9 @@ PAIRWISE = (
 )
 OPTi_GLOB = "optimization_function_results_seed*_run*.csv"
 
+# Stamps omitted from cross-run policy comparison (e.g. extra pilot runs).
+DEFAULT_EXCLUDE_STAMPS: frozenset[str] = frozenset({"seed42_run2"})
+
 OUT_RUN_LEVEL = "data/policy_comparison_run_level.csv"
 OUT_SUMMARY = "data/policy_comparison_summary.csv"
 OUT_SEGMENT = "data/policy_comparison_segment.csv"
@@ -99,14 +105,27 @@ class PairedResult:
 # ---------------------------------------------------------------------------
 # Discovery & loading
 # ---------------------------------------------------------------------------
-def discover_opti_files(data_dir: str) -> List[str]:
+def discover_opti_files(
+    data_dir: str,
+    exclude_stamps: Optional[frozenset[str]] = None,
+) -> List[str]:
     pattern = os.path.join(data_dir, OPTi_GLOB)
     files = sorted(glob.glob(pattern))
     if not files:
         fallback = os.path.join(data_dir, "optimization_function_results.csv")
         if os.path.exists(fallback):
-            return [fallback]
-    return files
+            files = [fallback]
+    excluded = exclude_stamps if exclude_stamps is not None else DEFAULT_EXCLUDE_STAMPS
+    if not excluded:
+        return files
+    kept: List[str] = []
+    for path in files:
+        key = _parse_stamp(path)
+        stamp = key.stamp if key else ""
+        if stamp in excluded:
+            continue
+        kept.append(path)
+    return kept
 
 
 def _parse_stamp(path: str) -> Optional[RunKey]:
@@ -566,14 +585,22 @@ def plot_final_f_bars(pivot: pd.DataFrame, out_path: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def run(data_dir: str = "data", n_boot: int = 10000) -> None:
+def run(
+    data_dir: str = "data",
+    n_boot: int = 10000,
+    exclude_stamps: Optional[frozenset[str]] = None,
+) -> None:
     os.makedirs(data_dir, exist_ok=True)
-    files = discover_opti_files(data_dir)
+    excluded = exclude_stamps if exclude_stamps is not None else DEFAULT_EXCLUDE_STAMPS
+    files = discover_opti_files(data_dir, exclude_stamps=excluded)
     if not files:
         print(f"No optimization CSVs found in {data_dir!r}. Run run_all.py first.")
         return
 
-    print(f"=== Policy Comparator ({len(files)} runs) ===\n")
+    print(f"=== Policy Comparator ({len(files)} runs) ===")
+    if excluded:
+        print(f"    Excluded stamps: {', '.join(sorted(excluded))}")
+    print()
     for f in files:
         print(f"  • {f}")
 
@@ -638,6 +665,13 @@ def run(data_dir: str = "data", n_boot: int = 10000) -> None:
     print("\nDone.")
 
 
+def _parse_exclude_stamps(raw: str) -> frozenset[str]:
+    """Comma-separated stamp names, e.g. seed42_run2,seed10_run0."""
+    if not raw.strip():
+        return frozenset()
+    return frozenset(s.strip() for s in raw.split(",") if s.strip())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare IB / MAS / Centaur across all runs.")
     parser.add_argument("--data-dir", default="data", help="Directory with stamped CSVs")
@@ -645,8 +679,20 @@ def main() -> None:
         "--bootstrap", type=int, default=10000,
         help="Bootstrap / permutation iterations",
     )
+    parser.add_argument(
+        "--exclude",
+        default=None,
+        help=(
+            "Comma-separated run stamps to omit (default: seed42_run2). "
+            "Pass empty string to include all discovered runs."
+        ),
+    )
     args = parser.parse_args()
-    run(data_dir=args.data_dir, n_boot=args.bootstrap)
+    if args.exclude is None:
+        exclude = DEFAULT_EXCLUDE_STAMPS
+    else:
+        exclude = _parse_exclude_stamps(args.exclude)
+    run(data_dir=args.data_dir, n_boot=args.bootstrap, exclude_stamps=exclude)
 
 
 if __name__ == "__main__":

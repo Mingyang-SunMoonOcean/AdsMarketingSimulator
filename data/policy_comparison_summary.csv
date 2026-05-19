@@ -1,4 +1,4 @@
 Comparison,Better,Worse,n_runs,wins,win_rate_pct,mean_diff_CHF,sd_diff_CHF,median_diff_CHF,ci95_low_CHF,ci95_high_CHF,cohens_d_paired,t_statistic,t_p_two_sided,wilcoxon_p_one_sided,perm_p_one_sided,significant_95_perm
-Centaur vs MAS,Centaur (CFL),MAS (OODA),11,10,90.9,25686.31,21497.62,29964.95,13080.07,37503.2,1.195,3.963,0.0001,0.005,0.0022,True
-Centaur vs IB,Centaur (CFL),Industry Baseline,11,11,100.0,73805.77,15876.12,68724.77,64989.83,82854.64,4.649,15.419,0.0,0.0017,0.0004,True
-MAS vs IB,MAS (OODA),Industry Baseline,11,11,100.0,48119.46,27478.22,37188.89,33053.59,64453.6,1.751,5.808,0.0,0.0017,0.0004,True
+Centaur vs MAS,Centaur (CFL),MAS (OODA),10,9,90.0,24721.99,22408.29,25285.63,11417.07,37501.45,1.103,3.489,0.0005,0.0083,0.0056,True
+Centaur vs IB,Centaur (CFL),Industry Baseline,10,10,100.0,74313.87,16640.36,75300.46,64519.82,84107.39,4.466,14.122,0.0,0.0025,0.0012,True
+MAS vs IB,MAS (OODA),Industry Baseline,10,10,100.0,49591.89,28503.49,44424.46,33449.05,66351.94,1.74,5.502,0.0,0.0025,0.0012,True
